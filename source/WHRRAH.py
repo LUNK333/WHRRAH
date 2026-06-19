@@ -232,7 +232,7 @@ class DataLog:
 
 WIDGET_TYPES = ["Lap Timer", "Numeric Display", "Bar Graph", "Track Map"]
 
-# Unscaled (scale=1.0) size per widget type — actual w/h/font_size are this times .scale.
+# Unscaled (scale=1.0) size per widget type — actual w/h/font_size are this times .scale_x/.scale_y.
 BASE_SIZES = {
     "Lap Timer": (220, 70),
     "Numeric Display": (200, 60),
@@ -253,17 +253,24 @@ class OverlayWidget:
         self.widget_type = widget_type
         self.x = x
         self.y = y
-        self.scale = scale
+        self.scale_x = scale
+        self.scale_y = scale
         self.channel: str = ""
         self.label: str = widget_type
         self.min_val: float = 0.0
         self.max_val: float = 100.0
         self.color: tuple = (0, 255, 0)  # BGR for OpenCV
+        self.show_value: bool = True  # Bar Graph: overlay the numeric value on the bar
         self.selected: bool = False
 
     @property
     def base_size(self) -> tuple[int, int]:
         return BASE_SIZES.get(self.widget_type, (200, 60))
+
+    def _numeric_ref_text(self) -> str:
+        # "000.00" covers triple-digit readings (e.g. mph) with two decimal
+        # places — a fixed budget so the box doesn't resize as the live value changes.
+        return f"{self.label}: 000.00"
 
     @property
     def w(self) -> int:
@@ -276,7 +283,12 @@ class OverlayWidget:
             (text_w, _), _ = cv2.getTextSize("Time: 00:00:000", cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
             padding = 16 + int(self.font_size * 0.3)
             return text_w + padding
-        return max(1, int(self.base_size[0] * self.scale))
+        if self.widget_type == "Numeric Display":
+            cv_scale = self.font_size / 30.0
+            (text_w, _), _ = cv2.getTextSize(self._numeric_ref_text(), cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
+            padding = 16 + int(self.font_size * 0.3)
+            return text_w + padding
+        return max(1, int(self.base_size[0] * self.scale_x))
 
     @property
     def h(self) -> int:
@@ -286,11 +298,16 @@ class OverlayWidget:
             # doesn't end up with a lot of empty space below the two lines.
             padding = 8 + int(self.font_size * 0.35)
             return _lap_timer_line_gap(self.font_size) * 2 + padding
-        return max(1, int(self.base_size[1] * self.scale))
+        if self.widget_type == "Numeric Display":
+            cv_scale = self.font_size / 30.0
+            (_, text_h), baseline = cv2.getTextSize(self._numeric_ref_text(), cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
+            padding = 16 + int(self.font_size * 0.4)
+            return text_h + baseline + padding
+        return max(1, int(self.base_size[1] * self.scale_y))
 
     @property
     def font_size(self) -> int:
-        return max(6, int(BASE_FONT_SIZE * self.scale))
+        return max(6, int(BASE_FONT_SIZE * self.scale_y))
 
     def rect(self) -> QRect:
         return QRect(self.x, self.y, self.w, self.h)
@@ -317,7 +334,7 @@ class OverlayWidget:
         elif self.widget_type == "Bar Graph":
             lo, hi = self.min_val, self.max_val
             pct = np.clip((val - lo) / (hi - lo) if hi != lo else 0, 0, 1)
-            _draw_bar(frame, x, y, w, h, self.label, val, pct, color_bgr)
+            _draw_bar(frame, x, y, w, h, self.label, val, pct, color_bgr, self.show_value)
 
         elif self.widget_type == "Lap Timer":
             _draw_lap_timer(frame, x, y, w, h, data_log.lap_time_at(time_sec),
@@ -336,17 +353,32 @@ def _draw_numeric(frame, x, y, w, h, label, value, font_size, color):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
     scale = font_size / 30.0
-    text = f"{label}: {value:.1f}"
+    text = f"{label}: {value:.2f}"
     cv2.putText(frame, text, (x + 8, y + h - 12), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
 
 
-def _draw_bar(frame, x, y, w, h, label, value, pct, color):
+def _draw_bar(frame, x, y, w, h, label, value, pct, color, show_value=True):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
     bar_w = int((w - 4) * pct)
     if bar_w > 0:
         cv2.rectangle(frame, (x + 2, y + 2), (x + 2 + bar_w, y + h - 2), color, -1)
-    cv2.putText(frame, f"{label}: {value:.1f}", (x + 4, y + h - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
+    text = f"{label}: {value:.1f}" if show_value else label
+
+    # Grow the text to fill the bar's height (clamped so it doesn't overflow
+    # the width), instead of a fixed small font regardless of widget scale.
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    thickness = 2
+    pad_x, pad_y = 6, 6
+    avail_w = max(1, w - pad_x * 2)
+    avail_h = max(1, h - pad_y * 2)
+    (tw1, th1), base1 = cv2.getTextSize(text, font, 1.0, thickness)
+    font_scale = max(0.3, min(avail_h / max(1, th1 + base1), avail_w / max(1, tw1)))
+
+    (tw, th), base = cv2.getTextSize(text, font, font_scale, thickness)
+    tx = x + pad_x
+    ty = y + (h + th) // 2
+    cv2.putText(frame, text, (tx, ty), font, font_scale, (230, 230, 230), thickness, cv2.LINE_AA)
 
 
 def _format_lap_clock(seconds: float) -> str:
@@ -596,16 +628,42 @@ class OverlayCanvas(QWidget):
                 draw_line(inner.y() + line_h, "Lap: ", str(lap))
             elif w.widget_type == "Bar Graph":
                 val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
+                text = f"{w.label}: {val:.1f}" if w.show_value else w.label
+                inner = rect.adjusted(6, 6, -6, -6)
+
+                # Grow the text to fill the bar's height (clamped to width),
+                # same fit-to-box approach as the cv2 export.
+                probe_pt = 20
+                probe_metrics = QFontMetrics(QFont("Monospace", probe_pt))
+                probe_w = probe_metrics.horizontalAdvance(text)
+                probe_h = probe_metrics.height()
+                fit_pt = max(6, int(min(probe_pt * inner.width() / max(1, probe_w),
+                                         probe_pt * inner.height() / max(1, probe_h))))
+                painter.setFont(QFont("Monospace", fit_pt))
                 painter.setPen(QPen(QColor(230, 230, 230)))
-                painter.drawText(rect.adjusted(4, 2, -4, -2), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom,
-                                 f"{w.label}: {val:.1f}")
+                painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+            elif w.widget_type == "Numeric Display":
+                val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
+                inner = rect.adjusted(8, 0, -4, 0)
+
+                # Box width is sized (in OverlayWidget.w) to fit the cv2-rendered
+                # reference string — Qt's font metrics differ, so pick the Qt
+                # point size that actually fills inner.width() with that same
+                # reference string, same fix as the Lap Timer.
+                ref_text = w._numeric_ref_text()
+                probe_pt = 20
+                probe_font = QFont("Monospace", probe_pt)
+                probe_font.setBold(True)
+                probe_w = QFontMetrics(probe_font).horizontalAdvance(ref_text)
+                fit_pt = max(6, int(probe_pt * inner.width() / max(1, probe_w)))
+                numeric_font = QFont("Monospace", fit_pt)
+                painter.setFont(numeric_font)
+                painter.setPen(QPen(QColor(230, 230, 230)))
+                painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                                 f"{w.label}: {val:.2f}")
             else:
-                val_str = ""
-                if self._data_log and w.channel:
-                    val = self._data_log.value_at(w.channel, self._preview_time)
-                    val_str = f"  [{val:.2f}]"
                 painter.drawText(rect.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-                                 f"{w.widget_type}\n{w.label}{val_str}")
+                                 w.label)
 
             # Resize handle
             if w.selected:
@@ -647,18 +705,62 @@ class OverlayCanvas(QWidget):
         self.selection_changed.emit(hit)
         self.update()
 
+    def _overlaps_others(self, widget: "OverlayWidget", x: int, y: int, w: int, h: int) -> bool:
+        for other in self.widgets:
+            if other is widget:
+                continue
+            if x < other.x + other.w and x + w > other.x and y < other.y + other.h and y + h > other.y:
+                return True
+        return False
+
+    def _find_free_spot(self, widget: "OverlayWidget") -> tuple[int, int]:
+        """Find a position for a newly added widget that doesn't overlap existing ones."""
+        step = 20
+        x, y = 50, 50
+        while self._overlaps_others(widget, x, y, widget.w, widget.h):
+            y += step
+            if y + widget.h > self.overlay_height:
+                y = 50
+                x += step * 3
+            if x + widget.w > self.overlay_width:
+                break  # no free space left — place it anyway rather than loop forever
+        return x, y
+
     def mouseMoveEvent(self, event):
         if not (self._dragging or self._resize_handle):
             return
         ox, oy = self._to_overlay(event.position().x(), event.position().y())
         if self.selected:
             if self._resize_handle:
-                base_w, _ = self.selected.base_size
+                base_w, base_h = self.selected.base_size
                 new_w = max(20, ox - self.selected.x)
-                self.selected.scale = max(0.2, new_w / base_w)
+                new_h = max(10, oy - self.selected.y)
+                prev_sx, prev_sy = self.selected.scale_x, self.selected.scale_y
+                if self.selected.widget_type == "Bar Graph":
+                    # Bar Graph supports independent x/y scaling via corner drag.
+                    self.selected.scale_x = max(0.2, new_w / base_w)
+                    self.selected.scale_y = max(0.2, new_h / base_h)
+                else:
+                    s = max(0.2, new_w / base_w)
+                    self.selected.scale_x = s
+                    self.selected.scale_y = s
+                # Reject resizes that would make the widget overlap a neighbor.
+                if self._overlaps_others(self.selected, self.selected.x, self.selected.y,
+                                          self.selected.w, self.selected.h):
+                    self.selected.scale_x, self.selected.scale_y = prev_sx, prev_sy
             else:
-                self.selected.x = max(0, min(self.overlay_width - self.selected.w, ox - self._drag_offset.x()))
-                self.selected.y = max(0, min(self.overlay_height - self.selected.h, oy - self._drag_offset.y()))
+                new_x = max(0, min(self.overlay_width - self.selected.w, ox - self._drag_offset.x()))
+                new_y = max(0, min(self.overlay_height - self.selected.h, oy - self._drag_offset.y()))
+                w_, h_ = self.selected.w, self.selected.h
+                # Try the full move; if it would overlap, slide along whichever
+                # single axis still works, so dragging diagonally past another
+                # widget slides along its edge instead of just freezing.
+                if not self._overlaps_others(self.selected, new_x, new_y, w_, h_):
+                    self.selected.x, self.selected.y = new_x, new_y
+                elif not self._overlaps_others(self.selected, new_x, self.selected.y, w_, h_):
+                    self.selected.x = new_x
+                elif not self._overlaps_others(self.selected, self.selected.x, new_y, w_, h_):
+                    self.selected.y = new_y
             self.update()
 
     def mouseReleaseEvent(self, event):
@@ -666,7 +768,8 @@ class OverlayCanvas(QWidget):
         self._resize_handle = False
 
     def add_widget(self, widget_type: str):
-        w = OverlayWidget(widget_type, x=50, y=50 + len(self.widgets) * 70)
+        w = OverlayWidget(widget_type)
+        w.x, w.y = self._find_free_spot(w)
         self.widgets.append(w)
         for ww in self.widgets:
             ww.selected = False
@@ -716,6 +819,10 @@ class PropertiesPanel(QWidget):
         self.btn_color.clicked.connect(self._on_pick_color)
         layout.addRow("Color:", self.btn_color)
 
+        self.chk_show_value = QCheckBox("Show numeric value")
+        self.chk_show_value.toggled.connect(self._on_show_value)
+        layout.addRow("", self.chk_show_value)
+
         self.lbl_no_channel_hint = QLabel()
         self.lbl_no_channel_hint.setWordWrap(True)
         layout.addRow("", self.lbl_no_channel_hint)
@@ -739,6 +846,19 @@ class PropertiesPanel(QWidget):
         self.spn_scale.valueChanged.connect(self._on_scale)
         layout.addRow("Scale:", self.spn_scale)
 
+        # Bar Graph gets independent x/y scaling instead of the single Scale field.
+        self.spn_scale_x = QDoubleSpinBox(); self.spn_scale_x.setRange(0.2, 10.0)
+        self.spn_scale_x.setSingleStep(0.1)
+        self.spn_scale_x.setValue(1.0)
+        self.spn_scale_x.valueChanged.connect(self._on_scale_xy)
+        layout.addRow("Scale X:", self.spn_scale_x)
+
+        self.spn_scale_y = QDoubleSpinBox(); self.spn_scale_y.setRange(0.2, 10.0)
+        self.spn_scale_y.setSingleStep(0.1)
+        self.spn_scale_y.setValue(1.0)
+        self.spn_scale_y.valueChanged.connect(self._on_scale_xy)
+        layout.addRow("Scale Y:", self.spn_scale_y)
+
         self.spn_min = QDoubleSpinBox(); self.spn_min.setRange(-99999, 99999)
         self.spn_max = QDoubleSpinBox(); self.spn_max.setRange(-99999, 99999); self.spn_max.setValue(100)
         self.spn_min.valueChanged.connect(self._on_range)
@@ -747,6 +867,9 @@ class PropertiesPanel(QWidget):
         layout.addRow("Max:", self.spn_max)
 
         self.lbl_no_channel_hint.setVisible(False)
+        self.chk_show_value.setVisible(False)
+        self._set_row_visible(self.spn_scale_x, False)
+        self._set_row_visible(self.spn_scale_y, False)
         self.setEnabled(False)
 
     def set_channels(self, channels: list[str]):
@@ -767,12 +890,20 @@ class PropertiesPanel(QWidget):
         self.lbl_type.setText(w.widget_type)
         self.txt_label.blockSignals(True); self.txt_label.setText(w.label); self.txt_label.blockSignals(False)
         self._update_color_swatch(w.color)
-        self.btn_color.setEnabled(w.widget_type == "Bar Graph")
+        is_bar = w.widget_type == "Bar Graph"
+        self.btn_color.setEnabled(is_bar)
+        self.chk_show_value.setVisible(is_bar)
+        self.chk_show_value.blockSignals(True); self.chk_show_value.setChecked(w.show_value); self.chk_show_value.blockSignals(False)
         idx = self.cmb_channel.findText(w.channel)
         self.cmb_channel.setCurrentIndex(idx if idx >= 0 else 0)
         for spn, val in [(self.spn_x, w.x), (self.spn_y, w.y)]:
             spn.blockSignals(True); spn.setValue(val); spn.blockSignals(False)
-        self.spn_scale.blockSignals(True); self.spn_scale.setValue(w.scale); self.spn_scale.blockSignals(False)
+        self.spn_scale.blockSignals(True); self.spn_scale.setValue(w.scale_x); self.spn_scale.blockSignals(False)
+        self.spn_scale_x.blockSignals(True); self.spn_scale_x.setValue(w.scale_x); self.spn_scale_x.blockSignals(False)
+        self.spn_scale_y.blockSignals(True); self.spn_scale_y.setValue(w.scale_y); self.spn_scale_y.blockSignals(False)
+        self._set_row_visible(self.spn_scale, not is_bar)
+        self._set_row_visible(self.spn_scale_x, is_bar)
+        self._set_row_visible(self.spn_scale_y, is_bar)
         self.spn_min.blockSignals(True); self.spn_min.setValue(w.min_val); self.spn_min.blockSignals(False)
         self.spn_max.blockSignals(True); self.spn_max.setValue(w.max_val); self.spn_max.blockSignals(False)
 
@@ -786,6 +917,11 @@ class PropertiesPanel(QWidget):
         self.cmb_channel.setEnabled(hint is None)
         self.spn_min.setEnabled(hint is None)
         self.spn_max.setEnabled(hint is None)
+
+    def _on_show_value(self, checked):
+        if self._widget:
+            self._widget.show_value = checked
+            self.changed.emit()
 
     def _on_label(self, text):
         if self._widget:
@@ -827,8 +963,22 @@ class PropertiesPanel(QWidget):
 
     def _on_scale(self):
         if self._widget:
-            self._widget.scale = self.spn_scale.value()
+            self._widget.scale_x = self.spn_scale.value()
+            self._widget.scale_y = self.spn_scale.value()
             self.changed.emit()
+
+    def _on_scale_xy(self):
+        if self._widget:
+            self._widget.scale_x = self.spn_scale_x.value()
+            self._widget.scale_y = self.spn_scale_y.value()
+            self.changed.emit()
+
+    def _set_row_visible(self, field_widget: QWidget, visible: bool):
+        layout: QFormLayout = self.layout()
+        label = layout.labelForField(field_widget)
+        if label:
+            label.setVisible(visible)
+        field_widget.setVisible(visible)
 
     def _on_range(self):
         if self._widget:
