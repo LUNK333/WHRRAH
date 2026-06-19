@@ -1,7 +1,7 @@
 [
   {
     "widget_type": "Lap Timer",
-    "x": 1413,
+    "x": 1414,
     "y": 0,
     "scale_x": 1.1818181818181819,
     "scale_y": 1.1818181818181819,
@@ -15,12 +15,21 @@
       0
     ],
     "show_value": true,
+    "text_color": [
+      0,
+      255,
+      255
+    ],
+    "show_time": true,
+    "show_last": true,
+    "show_best": true,
+    "show_lap": true,
     "selected": false
   },
   {
     "widget_type": "Numeric Display",
     "x": 1698,
-    "y": 900,
+    "y": 901,
     "scale_x": 1.24,
     "scale_y": 1.24,
     "channel": "GPS Speed",
@@ -33,6 +42,15 @@
       0
     ],
     "show_value": true,
+    "text_color": [
+      0,
+      255,
+      255
+    ],
+    "show_time": true,
+    "show_last": true,
+    "show_best": true,
+    "show_lap": true,
     "selected": false
   },
   {
@@ -51,6 +69,15 @@
       0
     ],
     "show_value": true,
+    "text_color": [
+      255,
+      255,
+      255
+    ],
+    "show_time": true,
+    "show_last": true,
+    "show_best": true,
+    "show_lap": true,
     "selected": false
   },
   {
@@ -69,6 +96,15 @@
       255
     ],
     "show_value": true,
+    "text_color": [
+      255,
+      255,
+      255
+    ],
+    "show_time": true,
+    "show_last": true,
+    "show_best": true,
+    "show_lap": true,
     "selected": false
   },
   {
@@ -87,6 +123,15 @@
       0
     ],
     "show_value": false,
+    "text_color": [
+      255,
+      255,
+      255
+    ],
+    "show_time": true,
+    "show_last": true,
+    "show_best": true,
+    "show_lap": true,
     "selected": false
   }
 ]

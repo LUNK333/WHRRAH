@@ -5,6 +5,7 @@ Renders a green-screen overlay video to composite in DaVinci Resolve.
 """
 
 import sys
+import argparse
 import os
 import csv
 import json
@@ -219,6 +220,29 @@ class DataLog:
                 break
         return lap
 
+    def lap_duration(self, lap_number: int) -> float | None:
+        """Duration of a completed lap, or None if it hasn't finished (or doesn't exist)."""
+        if lap_number == 0:
+            if not self.beacon_markers or not self.timestamps:
+                return None
+            return self.beacon_markers[0] - self.timestamps[0]
+        if 0 < lap_number <= len(self.beacon_markers) - 1:
+            return self.beacon_markers[lap_number] - self.beacon_markers[lap_number - 1]
+        return None
+
+    def last_lap_time_at(self, time_sec: float) -> float | None:
+        """Duration of the most recently completed lap as of time_sec, or None if no lap has finished yet."""
+        current_lap = self.lap_number_at(time_sec)
+        if current_lap == 0:
+            return None
+        return self.lap_duration(current_lap - 1)
+
+    def best_lap_time_at(self, time_sec: float) -> float | None:
+        """Fastest completed lap so far as of time_sec, or None if no lap has finished yet."""
+        current_lap = self.lap_number_at(time_sec)
+        durations = [d for n in range(current_lap) if (d := self.lap_duration(n)) is not None]
+        return min(durations) if durations else None
+
     def channel_range(self, channel: str) -> tuple[float, float]:
         if channel not in self.channels:
             return (0.0, 1.0)
@@ -261,11 +285,29 @@ class OverlayWidget:
         self.max_val: float = 100.0
         self.color: tuple = (0, 255, 0)  # BGR for OpenCV
         self.show_value: bool = True  # Bar Graph: overlay the numeric value on the bar
+        self.text_color: tuple = (255, 255, 255)  # BGR, Lap Timer text — default white
+        self.show_time: bool = True  # Lap Timer: which lines to render
+        self.show_last: bool = True
+        self.show_best: bool = True
+        self.show_lap: bool = True
         self.selected: bool = False
 
     @property
     def base_size(self) -> tuple[int, int]:
         return BASE_SIZES.get(self.widget_type, (200, 60))
+
+    def lap_timer_lines(self) -> list[str]:
+        """Which lines ("Time"/"Last"/"Best"/"Lap") this Lap Timer should show, in order."""
+        lines = []
+        if self.show_time:
+            lines.append("Time")
+        if self.show_last:
+            lines.append("Last")
+        if self.show_best:
+            lines.append("Best")
+        if self.show_lap:
+            lines.append("Lap")
+        return lines
 
     def _numeric_ref_text(self) -> str:
         # "000.00" covers triple-digit readings (e.g. mph) with two decimal
@@ -275,12 +317,13 @@ class OverlayWidget:
     @property
     def w(self) -> int:
         if self.widget_type == "Lap Timer":
-            # "Time: 00:00:000" is the longest line the widget ever renders
-            # (fixed-width clock format) — size the box to it, same font/scale/
-            # thickness as the actual draw call, so width tracks text width
-            # instead of growing arbitrarily with scale.
+            # Longest line actually shown determines the width — "Lap: 0" is much
+            # narrower than the clock lines, so a Lap-only timer doesn't end up
+            # arbitrarily wide.
+            lines = self.lap_timer_lines()
+            ref_text = "Time: 00:00:000" if any(l in ("Time", "Last", "Best") for l in lines) else "Lap: 0"
             cv_scale = self.font_size / 28.0
-            (text_w, _), _ = cv2.getTextSize("Time: 00:00:000", cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
+            (text_w, _), _ = cv2.getTextSize(ref_text, cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
             padding = 16 + int(self.font_size * 0.3)
             return text_w + padding
         if self.widget_type == "Numeric Display":
@@ -295,9 +338,11 @@ class OverlayWidget:
         if self.widget_type == "Lap Timer":
             # Box height tracks actual text height (which grows sub-linearly via
             # _lap_timer_line_gap), not the scale factor directly, so the box
-            # doesn't end up with a lot of empty space below the two lines.
+            # doesn't end up with a lot of empty space below the lines — and it
+            # scales with however many of Time/Last/Best/Lap are enabled.
+            n_lines = max(1, len(self.lap_timer_lines()))
             padding = 8 + int(self.font_size * 0.35)
-            return _lap_timer_line_gap(self.font_size) * 2 + padding
+            return _lap_timer_line_gap(self.font_size) * n_lines + padding
         if self.widget_type == "Numeric Display":
             cv_scale = self.font_size / 30.0
             (_, text_h), baseline = cv2.getTextSize(self._numeric_ref_text(), cv2.FONT_HERSHEY_SIMPLEX, cv_scale, 2)
@@ -329,16 +374,26 @@ class OverlayWidget:
         val = data_log.value_at(self.channel, time_sec) if self.channel else 0.0
 
         if self.widget_type == "Numeric Display":
-            _draw_numeric(frame, x, y, w, h, self.label, val, self.font_size, color_bgr)
+            _draw_numeric(frame, x, y, w, h, self.label, val, self.font_size, color_bgr, self.text_color)
 
         elif self.widget_type == "Bar Graph":
             lo, hi = self.min_val, self.max_val
             pct = np.clip((val - lo) / (hi - lo) if hi != lo else 0, 0, 1)
-            _draw_bar(frame, x, y, w, h, self.label, val, pct, color_bgr, self.show_value)
+            _draw_bar(frame, x, y, w, h, self.label, val, pct, color_bgr, self.text_color, self.show_value)
 
         elif self.widget_type == "Lap Timer":
-            _draw_lap_timer(frame, x, y, w, h, data_log.lap_time_at(time_sec),
-                             data_log.lap_number_at(time_sec), self.font_size, color_bgr)
+            lines = []
+            if self.show_time:
+                lines.append(("Time: ", _format_lap_clock(data_log.lap_time_at(time_sec))))
+            if self.show_last:
+                last = data_log.last_lap_time_at(time_sec)
+                lines.append(("Last: ", _format_lap_clock(last) if last is not None else "--:--:---"))
+            if self.show_best:
+                best = data_log.best_lap_time_at(time_sec)
+                lines.append(("Best: ", _format_lap_clock(best) if best is not None else "--:--:---"))
+            if self.show_lap:
+                lines.append(("Lap: ", str(data_log.lap_number_at(time_sec))))
+            _draw_lap_timer(frame, x, y, w, h, lines, self.font_size, color_bgr, self.text_color)
 
         elif self.widget_type == "Track Map":
             if "GPS Latitude" in data_log.channels and "GPS Longitude" in data_log.channels:
@@ -349,15 +404,15 @@ class OverlayWidget:
 # OpenCV drawing helpers
 # ---------------------------------------------------------------------------
 
-def _draw_numeric(frame, x, y, w, h, label, value, font_size, color):
+def _draw_numeric(frame, x, y, w, h, label, value, font_size, border_color, text_color):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), border_color, 2)
     scale = font_size / 30.0
     text = f"{label}: {value:.2f}"
-    cv2.putText(frame, text, (x + 8, y + h - 12), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+    cv2.putText(frame, text, (x + 8, y + h - 12), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 2, cv2.LINE_AA)
 
 
-def _draw_bar(frame, x, y, w, h, label, value, pct, color, show_value=True):
+def _draw_bar(frame, x, y, w, h, label, value, pct, color, text_color, show_value=True):
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
     bar_w = int((w - 4) * pct)
@@ -378,7 +433,7 @@ def _draw_bar(frame, x, y, w, h, label, value, pct, color, show_value=True):
     (tw, th), base = cv2.getTextSize(text, font, font_scale, thickness)
     tx = x + pad_x
     ty = y + (h + th) // 2
-    cv2.putText(frame, text, (tx, ty), font, font_scale, (230, 230, 230), thickness, cv2.LINE_AA)
+    cv2.putText(frame, text, (tx, ty), font, font_scale, text_color, thickness, cv2.LINE_AA)
 
 
 def _format_lap_clock(seconds: float) -> str:
@@ -390,27 +445,26 @@ def _format_lap_clock(seconds: float) -> str:
 
 
 def _lap_timer_line_gap(font_size: int) -> int:
-    """Vertical distance between the two lines. Grows sub-linearly with font_size
+    """Vertical distance between lines. Grows sub-linearly with font_size
     (sqrt) so the lines don't spread far apart at high widget scale."""
     base_gap = BASE_FONT_SIZE * 1.3
     return int(base_gap * (font_size / BASE_FONT_SIZE) ** 0.5)
 
 
-def _draw_lap_timer(frame, x, y, w, h, seconds, lap_number, font_size, color):
-    """Two lines per 'lap timer format.pdf': 'Time: <bold XX:XX:XX>' / 'Lap: <bold X>'."""
+def _draw_lap_timer(frame, x, y, w, h, lines, font_size, border_color, text_color):
+    """Renders whichever of Time/Last/Best/Lap lines are enabled, per
+    'lap timer format v2.pdf'. lines is [(label, value_str), ...] top to bottom."""
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
-    cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
+    cv2.rectangle(frame, (x, y), (x + w, y + h), border_color, 2)
     scale = font_size / 28.0
     font = cv2.FONT_HERSHEY_SIMPLEX
     line_h = _lap_timer_line_gap(font_size)
 
-    def draw_label_value(label, value, ty):
-        cv2.putText(frame, label, (x + 8, ty), font, scale, color, 1, cv2.LINE_AA)
+    for i, (label, value) in enumerate(lines):
+        ty = y + line_h * (i + 1)
+        cv2.putText(frame, label, (x + 8, ty), font, scale, text_color, 1, cv2.LINE_AA)
         (label_w, _), _ = cv2.getTextSize(label, font, scale, 1)
-        cv2.putText(frame, value, (x + 8 + label_w, ty), font, scale, color, 2, cv2.LINE_AA)
-
-    draw_label_value("Time: ", _format_lap_clock(seconds), y + line_h)
-    draw_label_value("Lap: ", str(lap_number), y + line_h * 2 + 4)
+        cv2.putText(frame, value, (x + 8 + label_w, ty), font, scale, text_color, 2, cv2.LINE_AA)
 
 
 def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float):
@@ -596,16 +650,29 @@ class OverlayCanvas(QWidget):
                 painter.drawText(rect.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                                  w.label)
             elif w.widget_type == "Lap Timer":
-                lap = self._data_log.lap_number_at(self._preview_time) if self._data_log else 0
-                t = self._data_log.lap_time_at(self._preview_time) if self._data_log else 0.0
+                dl = self._data_log
+                t = self._preview_time
+                lap_lines = []
+                if w.show_time:
+                    lap_lines.append(("Time: ", _format_lap_clock(dl.lap_time_at(t)) if dl else "00:00:000"))
+                if w.show_last:
+                    last = dl.last_lap_time_at(t) if dl else None
+                    lap_lines.append(("Last: ", _format_lap_clock(last) if last is not None else "--:--:---"))
+                if w.show_best:
+                    best = dl.best_lap_time_at(t) if dl else None
+                    lap_lines.append(("Best: ", _format_lap_clock(best) if best is not None else "--:--:---"))
+                if w.show_lap:
+                    lap_lines.append(("Lap: ", str(dl.lap_number_at(t)) if dl else "0"))
+
                 inner = rect.adjusted(8, 4, -4, -4)
                 line_h = max(1, int(_lap_timer_line_gap(w.font_size) * s))
+                text_color = QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)
 
-                # box width is sized (in OverlayWidget.w) to fit "Time: 00:00:000"
-                # rendered with cv2 — Qt's font metrics differ, so pick the Qt
-                # point size that actually fills inner.width() with that same
-                # reference string, rather than reusing the generic pt_size.
-                ref_text = "Time: 00:00:000"
+                # box width is sized (in OverlayWidget.w) to fit the cv2-rendered
+                # reference text — Qt's font metrics differ, so pick the Qt point
+                # size that actually fills inner.width() with that same reference,
+                # rather than reusing the generic pt_size.
+                ref_text = "Time: 00:00:000" if any(l in ("Time: ", "Last: ", "Best: ") for l, _ in lap_lines) else "Lap: 0"
                 probe_pt = 20
                 probe_font = QFont("Monospace", probe_pt)
                 probe_font.setBold(True)
@@ -618,14 +685,15 @@ class OverlayCanvas(QWidget):
                 def draw_line(top, label, value):
                     line_rect = QRect(inner.x(), top, inner.width(), line_h)
                     painter.setFont(font)
+                    painter.setPen(QPen(text_color))
                     painter.drawText(line_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, label)
                     label_w = painter.fontMetrics().horizontalAdvance(label)
                     painter.setFont(bold_font)
                     value_rect = QRect(inner.x() + label_w, top, inner.width() - label_w, line_h)
                     painter.drawText(value_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, value)
 
-                draw_line(inner.y(), "Time: ", _format_lap_clock(t))
-                draw_line(inner.y() + line_h, "Lap: ", str(lap))
+                for i, (label, value) in enumerate(lap_lines):
+                    draw_line(inner.y() + line_h * i, label, value)
             elif w.widget_type == "Bar Graph":
                 val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
                 text = f"{w.label}: {val:.1f}" if w.show_value else w.label
@@ -640,7 +708,7 @@ class OverlayCanvas(QWidget):
                 fit_pt = max(6, int(min(probe_pt * inner.width() / max(1, probe_w),
                                          probe_pt * inner.height() / max(1, probe_h))))
                 painter.setFont(QFont("Monospace", fit_pt))
-                painter.setPen(QPen(QColor(230, 230, 230)))
+                painter.setPen(QPen(QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)))
                 painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
             elif w.widget_type == "Numeric Display":
                 val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
@@ -658,7 +726,7 @@ class OverlayCanvas(QWidget):
                 fit_pt = max(6, int(probe_pt * inner.width() / max(1, probe_w)))
                 numeric_font = QFont("Monospace", fit_pt)
                 painter.setFont(numeric_font)
-                painter.setPen(QPen(QColor(230, 230, 230)))
+                painter.setPen(QPen(QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)))
                 painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                  f"{w.label}: {val:.2f}")
             else:
@@ -823,9 +891,25 @@ class PropertiesPanel(QWidget):
         self.chk_show_value.toggled.connect(self._on_show_value)
         layout.addRow("", self.chk_show_value)
 
-        self.lbl_no_channel_hint = QLabel()
-        self.lbl_no_channel_hint.setWordWrap(True)
-        layout.addRow("", self.lbl_no_channel_hint)
+        self.btn_text_color = QPushButton("Text Color…")
+        self.btn_text_color.clicked.connect(self._on_pick_text_color)
+        layout.addRow("Text Color:", self.btn_text_color)
+
+        self.chk_show_time = QCheckBox("Show Time")
+        self.chk_show_time.toggled.connect(self._on_lap_lines)
+        layout.addRow("", self.chk_show_time)
+
+        self.chk_show_last = QCheckBox("Show Last")
+        self.chk_show_last.toggled.connect(self._on_lap_lines)
+        layout.addRow("", self.chk_show_last)
+
+        self.chk_show_best = QCheckBox("Show Best")
+        self.chk_show_best.toggled.connect(self._on_lap_lines)
+        layout.addRow("", self.chk_show_best)
+
+        self.chk_show_lap = QCheckBox("Show Lap")
+        self.chk_show_lap.toggled.connect(self._on_lap_lines)
+        layout.addRow("", self.chk_show_lap)
 
         self.cmb_channel = QComboBox()
         self.cmb_channel.addItem("(none)")
@@ -866,8 +950,13 @@ class PropertiesPanel(QWidget):
         layout.addRow("Min:", self.spn_min)
         layout.addRow("Max:", self.spn_max)
 
-        self.lbl_no_channel_hint.setVisible(False)
         self.chk_show_value.setVisible(False)
+        self._set_row_visible(self.btn_color, False)
+        self._set_row_visible(self.btn_text_color, False)
+        self._set_row_visible(self.chk_show_time, False)
+        self._set_row_visible(self.chk_show_last, False)
+        self._set_row_visible(self.chk_show_best, False)
+        self._set_row_visible(self.chk_show_lap, False)
         self._set_row_visible(self.spn_scale_x, False)
         self._set_row_visible(self.spn_scale_y, False)
         self.setEnabled(False)
@@ -891,9 +980,24 @@ class PropertiesPanel(QWidget):
         self.txt_label.blockSignals(True); self.txt_label.setText(w.label); self.txt_label.blockSignals(False)
         self._update_color_swatch(w.color)
         is_bar = w.widget_type == "Bar Graph"
-        self.btn_color.setEnabled(is_bar)
+        is_lap_timer = w.widget_type == "Lap Timer"
+        has_text_color = w.widget_type in ("Lap Timer", "Bar Graph", "Numeric Display")
+        no_channel = is_lap_timer or w.widget_type == "Track Map"
+        # Track Map doesn't render anything in widget.color — the generic
+        # Color picker is otherwise the fill (Bar Graph) / border (Numeric
+        # Display) color; Text Color is separate and used by all three
+        # text-bearing widget types.
+        self._set_row_visible(self.btn_color, w.widget_type in ("Bar Graph", "Numeric Display"))
         self.chk_show_value.setVisible(is_bar)
         self.chk_show_value.blockSignals(True); self.chk_show_value.setChecked(w.show_value); self.chk_show_value.blockSignals(False)
+
+        self._set_row_visible(self.btn_text_color, has_text_color)
+        self._update_text_color_swatch(w.text_color)
+        for chk_row, attr in [(self.chk_show_time, "show_time"), (self.chk_show_last, "show_last"),
+                               (self.chk_show_best, "show_best"), (self.chk_show_lap, "show_lap")]:
+            self._set_row_visible(chk_row, is_lap_timer)
+            chk_row.blockSignals(True); chk_row.setChecked(getattr(w, attr)); chk_row.blockSignals(False)
+
         idx = self.cmb_channel.findText(w.channel)
         self.cmb_channel.setCurrentIndex(idx if idx >= 0 else 0)
         for spn, val in [(self.spn_x, w.x), (self.spn_y, w.y)]:
@@ -907,16 +1011,9 @@ class PropertiesPanel(QWidget):
         self.spn_min.blockSignals(True); self.spn_min.setValue(w.min_val); self.spn_min.blockSignals(False)
         self.spn_max.blockSignals(True); self.spn_max.setValue(w.max_val); self.spn_max.blockSignals(False)
 
-        no_channel_hints = {
-            "Lap Timer": "Derived from Beacon Markers in the log — no channel needed.",
-            "Track Map": "Uses GPS Latitude/Longitude directly — no channel needed.",
-        }
-        hint = no_channel_hints.get(w.widget_type)
-        self.lbl_no_channel_hint.setText(hint or "")
-        self.lbl_no_channel_hint.setVisible(hint is not None)
-        self.cmb_channel.setEnabled(hint is None)
-        self.spn_min.setEnabled(hint is None)
-        self.spn_max.setEnabled(hint is None)
+        self.cmb_channel.setEnabled(not no_channel)
+        self.spn_min.setEnabled(not no_channel)
+        self.spn_max.setEnabled(not no_channel)
 
     def _on_show_value(self, checked):
         if self._widget:
@@ -940,6 +1037,28 @@ class PropertiesPanel(QWidget):
         if chosen.isValid():
             self._widget.color = (chosen.blue(), chosen.green(), chosen.red())  # BGR for OpenCV
             self._update_color_swatch(self._widget.color)
+            self.changed.emit()
+
+    def _update_text_color_swatch(self, color_bgr: tuple):
+        r, g, b = reversed(color_bgr) if len(color_bgr) == 3 else (255, 255, 255)
+        self.btn_text_color.setStyleSheet(f"background-color: rgb({r},{g},{b});")
+
+    def _on_pick_text_color(self):
+        if not self._widget:
+            return
+        r, g, b = reversed(self._widget.text_color) if len(self._widget.text_color) == 3 else (255, 255, 255)
+        chosen = QColorDialog.getColor(QColor(r, g, b), self, "Pick Text Color")
+        if chosen.isValid():
+            self._widget.text_color = (chosen.blue(), chosen.green(), chosen.red())  # BGR for OpenCV
+            self._update_text_color_swatch(self._widget.text_color)
+            self.changed.emit()
+
+    def _on_lap_lines(self):
+        if self._widget:
+            self._widget.show_time = self.chk_show_time.isChecked()
+            self._widget.show_last = self.chk_show_last.isChecked()
+            self._widget.show_best = self.chk_show_best.isChecked()
+            self._widget.show_lap = self.chk_show_lap.isChecked()
             self.changed.emit()
 
     def _on_channel(self, text):
@@ -993,23 +1112,39 @@ class PropertiesPanel(QWidget):
 
 class ExportThread(QThread):
     progress = Signal(int)
-    finished = Signal(str)
+    finished = Signal(str, str)  # (video_path, sync_file_path or "")
     error = Signal(str)
+    canceled = Signal()
 
-    def __init__(self, widgets, data_log, fps, out_path):
+    def __init__(self, widgets, data_log, fps, out_path,
+                 lap_windows: list[tuple[float, float, list[tuple[int, float]]]] | None = None,
+                 write_sync_file: bool = False):
         super().__init__()
         self.widgets = widgets
         self.data_log = data_log
         self.fps = fps
         self.out_path = out_path
+        # Each window: (render_start, render_end, markers). render_start/end is
+        # the (possibly padded) range to render — contiguous selected laps share
+        # one window so padding only lands at the outer edges, not in between.
+        # markers is [(lap_number, true_lap_start), ...] for the sync file.
+        self.lap_windows = lap_windows or [
+            (data_log.timestamps[0], data_log.timestamps[-1], [(0, data_log.timestamps[0])])
+        ]
+        self.write_sync_file = write_sync_file
+        self._cancel_requested = False
+
+    def cancel(self):
+        self._cancel_requested = True
 
     def run(self):
+        writer = None
         try:
             dl = self.data_log
-            duration = dl.duration
-            total_frames = int(duration * self.fps)
+            frames_per_window = [max(0, int((end - start) * self.fps)) for start, end, _ in self.lap_windows]
+            total_frames = sum(frames_per_window)
             if total_frames == 0:
-                self.error.emit("Data log has zero duration.")
+                self.error.emit("Selected laps have zero duration.")
                 return
 
             # Determine resolution from first widget bounds or default
@@ -1022,17 +1157,45 @@ class ExportThread(QThread):
             green = np.zeros((h_max, w_max, 3), dtype=np.uint8)
             green[:, :] = (0, 180, 0)  # pure BGR green screen
 
-            for frame_idx in range(total_frames):
-                t = dl.timestamps[0] + frame_idx / self.fps
-                frame = green.copy()
-                for ww in self.widgets:
-                    ww.render_to_frame(frame, dl, t)
-                writer.write(frame)
-                self.progress.emit(int(frame_idx / total_frames * 100))
+            done = 0
+            sync_entries = []  # (lap_number, frame_idx, time_sec)
+            for (start, _end, markers), n_frames in zip(self.lap_windows, frames_per_window):
+                for lap_number, marker_t in markers:
+                    marker_frame_in_window = max(0, min(n_frames - 1, int(round((marker_t - start) * self.fps))))
+                    sync_entries.append((lap_number, done + marker_frame_in_window,
+                                          (done + marker_frame_in_window) / self.fps))
+
+                for frame_idx in range(n_frames):
+                    if self._cancel_requested:
+                        writer.release()
+                        writer = None
+                        if os.path.exists(self.out_path):
+                            os.remove(self.out_path)
+                        self.canceled.emit()
+                        return
+                    t = start + frame_idx / self.fps
+                    frame = green.copy()
+                    for ww in self.widgets:
+                        ww.render_to_frame(frame, dl, t)
+                    writer.write(frame)
+                    done += 1
+                    self.progress.emit(int(done / total_frames * 100))
 
             writer.release()
-            self.finished.emit(self.out_path)
+            writer = None
+
+            sync_path = ""
+            if self.write_sync_file:
+                sync_path = os.path.splitext(self.out_path)[0] + "_sync.txt"
+                with open(sync_path, "w") as f:
+                    f.write("Lap sync points — frame numbers and timestamps in the exported video\n\n")
+                    for lap_number, frame_idx, time_sec in sync_entries:
+                        f.write(f"Lap {lap_number}: frame {frame_idx}, time {_format_lap_clock(time_sec)}\n")
+
+            self.finished.emit(self.out_path, sync_path)
         except Exception as e:
+            if writer is not None:
+                writer.release()
             self.error.emit(str(e))
 
 
@@ -1101,6 +1264,74 @@ class LapTickBar(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Lap selection dialog (for export)
+# ---------------------------------------------------------------------------
+
+class LapSelectDialog(QDialog):
+    """Lets the user pick which laps to include in the exported video."""
+
+    def __init__(self, lap_ranges: list[tuple[int, float, float]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Select Laps to Export")
+        self._checkboxes: list[QCheckBox] = []
+
+        layout = QVBoxLayout(self)
+
+        btn_row = QHBoxLayout()
+        btn_all = QPushButton("Select All")
+        btn_none = QPushButton("Select None")
+        btn_all.clicked.connect(lambda: self._set_all(True))
+        btn_none.clicked.connect(lambda: self._set_all(False))
+        btn_row.addWidget(btn_all)
+        btn_row.addWidget(btn_none)
+        layout.addLayout(btn_row)
+
+        list_widget = QListWidget()
+        for lap_num, start, end in lap_ranges:
+            item = QListWidgetItem(list_widget)
+            chk = QCheckBox(f"Lap {lap_num}  ({_format_lap_clock(end - start)})")
+            chk.setChecked(True)
+            self._checkboxes.append(chk)
+            list_widget.setItemWidget(item, chk)
+        layout.addWidget(list_widget)
+
+        pad_row = QHBoxLayout()
+        self.chk_pad = QCheckBox("Pad start/end of each lap by")
+        self.spn_pad = QDoubleSpinBox()
+        self.spn_pad.setRange(0.0, 120.0)
+        self.spn_pad.setSingleStep(1.0)
+        self.spn_pad.setValue(10.0)
+        self.spn_pad.setSuffix(" s")
+        self.spn_pad.setEnabled(False)
+        self.chk_pad.toggled.connect(self.spn_pad.setEnabled)
+        pad_row.addWidget(self.chk_pad)
+        pad_row.addWidget(self.spn_pad)
+        pad_row.addStretch()
+        layout.addLayout(pad_row)
+
+        self.chk_sync_file = QCheckBox("Generate sync .txt file (frame/timestamp at each lap start)")
+        layout.addWidget(self.chk_sync_file)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _set_all(self, checked: bool):
+        for chk in self._checkboxes:
+            chk.setChecked(checked)
+
+    def pad_seconds(self) -> float:
+        return self.spn_pad.value() if self.chk_pad.isChecked() else 0.0
+
+    def sync_file_enabled(self) -> bool:
+        return self.chk_sync_file.isChecked()
+
+    def selected_indices(self) -> list[int]:
+        return [i for i, chk in enumerate(self._checkboxes) if chk.isChecked()]
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
@@ -1110,6 +1341,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("We Have RaceRender At Home")
         self.resize(1400, 800)
         self.data_log = DataLog()
+        self.lap_starts: list[float] = []
         self._build_ui()
         self._build_menu()
         self.statusBar().showMessage("Load a data log to get started.")
@@ -1172,6 +1404,15 @@ class MainWindow(QMainWindow):
         ll.addWidget(self.btn_open_log)
         ll.addWidget(self.lbl_log)
 
+        grp_layout = QGroupBox("Layout")
+        lyl = QVBoxLayout(grp_layout)
+        self.btn_save_layout = QPushButton("Save Layout…")
+        self.btn_save_layout.clicked.connect(self.save_layout)
+        self.btn_load_layout = QPushButton("Load Layout…")
+        self.btn_load_layout.clicked.connect(self.load_layout)
+        lyl.addWidget(self.btn_save_layout)
+        lyl.addWidget(self.btn_load_layout)
+
         grp_widgets = QGroupBox("Add Widget")
         wl = QVBoxLayout(grp_widgets)
         for wtype in WIDGET_TYPES:
@@ -1198,6 +1439,7 @@ class MainWindow(QMainWindow):
         fl.addRow("FPS:", self.spn_fps)
 
         left_layout.addWidget(grp_log)
+        left_layout.addWidget(grp_layout)
         left_layout.addWidget(grp_widgets)
         left_layout.addWidget(self.btn_delete)
         left_layout.addWidget(grp_res)
@@ -1331,8 +1573,8 @@ class MainWindow(QMainWindow):
 
             t0 = self.data_log.timestamps[0] if self.data_log.timestamps else 0.0
             t_end = self.data_log.timestamps[-1] if self.data_log.timestamps else 0.0
-            lap_starts = [t0] + [m for m in self.data_log.beacon_markers if m < t_end]
-            self.lap_ticks.set_markers(lap_starts, t0, self.data_log.duration)
+            self.lap_starts = [t0] + [m for m in self.data_log.beacon_markers if m < t_end]
+            self.lap_ticks.set_markers(self.lap_starts, t0, self.data_log.duration)
 
             self.statusBar().showMessage(f"Loaded {len(channels)} channels, {self.data_log.duration:.1f}s duration")
         except Exception as e:
@@ -1342,6 +1584,9 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Save Layout", "", "JSON (*.json)")
         if not path:
             return
+        self.save_layout_file(path)
+
+    def save_layout_file(self, path: str):
         data = [w.to_dict() for w in self.canvas.widgets]
         with open(path, "w") as f:
             json.dump(data, f, indent=2)
@@ -1351,14 +1596,20 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Load Layout", "", "JSON (*.json)")
         if not path:
             return
-        with open(path) as f:
-            data = json.load(f)
-        self.canvas.widgets = [OverlayWidget.from_dict(d) for d in data]
-        self.canvas.selected = None
-        self.canvas.update()
-        self.props.load_widget(None)
-        self.btn_delete.setEnabled(False)
-        self.statusBar().showMessage(f"Layout loaded from {path}")
+        self.load_layout_file(path)
+
+    def load_layout_file(self, path: str):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self.canvas.widgets = [OverlayWidget.from_dict(d) for d in data]
+            self.canvas.selected = None
+            self.canvas.update()
+            self.props.load_widget(None)
+            self.btn_delete.setEnabled(False)
+            self.statusBar().showMessage(f"Layout loaded from {path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Load Error", str(e))
 
     def export_video(self):
         if not self.data_log.timestamps:
@@ -1367,6 +1618,44 @@ class MainWindow(QMainWindow):
         if not self.canvas.widgets:
             QMessageBox.warning(self, "No Widgets", "Add at least one widget before exporting.")
             return
+
+        t0 = self.data_log.timestamps[0]
+        t_end = self.data_log.timestamps[-1]
+        lap_ranges = [
+            (i, start, self.lap_starts[i + 1] if i + 1 < len(self.lap_starts) else t_end)
+            for i, start in enumerate(self.lap_starts)
+        ]
+
+        lap_windows = None
+        write_sync_file = False
+        if lap_ranges:
+            lap_dialog = LapSelectDialog(lap_ranges, self)
+            if lap_dialog.exec() != QDialog.DialogCode.Accepted:
+                return
+            selected = lap_dialog.selected_indices()
+            if not selected:
+                QMessageBox.warning(self, "No Laps Selected", "Select at least one lap to export.")
+                return
+            pad = lap_dialog.pad_seconds()
+            write_sync_file = lap_dialog.sync_file_enabled()
+
+            # Group contiguous selected laps (e.g. 2 and 3) into one render
+            # window so padding only lands before the first and after the
+            # last lap of the run, not in between adjacent laps.
+            selected = sorted(selected)
+            groups = [[selected[0]]]
+            for idx in selected[1:]:
+                if idx == groups[-1][-1] + 1:
+                    groups[-1].append(idx)
+                else:
+                    groups.append([idx])
+
+            lap_windows = []
+            for group in groups:
+                group_start = lap_ranges[group[0]][1]
+                group_end = lap_ranges[group[-1]][2]
+                markers = [(lap_ranges[i][0], lap_ranges[i][1]) for i in group]
+                lap_windows.append((max(t0, group_start - pad), min(t_end, group_end + pad), markers))
 
         path, _ = QFileDialog.getSaveFileName(self, "Export Video", "overlay.mp4", "MP4 Video (*.mp4)")
         if not path:
@@ -1377,16 +1666,24 @@ class MainWindow(QMainWindow):
         progress.show()
 
         self._export_thread = ExportThread(
-            self.canvas.widgets, self.data_log, self.spn_fps.value(), path
+            self.canvas.widgets, self.data_log, self.spn_fps.value(), path, lap_windows, write_sync_file
         )
+        progress.canceled.connect(self._export_thread.cancel)
         self._export_thread.progress.connect(progress.setValue)
-        self._export_thread.finished.connect(lambda p: (
+        self._export_thread.finished.connect(lambda video_path, sync_path: (
             progress.close(),
-            QMessageBox.information(self, "Done", f"Exported to:\n{p}")
+            QMessageBox.information(
+                self, "Done",
+                f"Exported to:\n{video_path}" + (f"\n\nSync file:\n{sync_path}" if sync_path else "")
+            )
         ))
         self._export_thread.error.connect(lambda e: (
             progress.close(),
             QMessageBox.critical(self, "Export Error", e)
+        ))
+        self._export_thread.canceled.connect(lambda: (
+            progress.close(),
+            self.statusBar().showMessage("Export canceled.")
         ))
         self._export_thread.start()
 
@@ -1396,10 +1693,17 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(description="We Have RaceRender At Home")
+    parser.add_argument("csv", nargs="?", help="AiM RS2 CSV log to auto-load on launch")
+    parser.add_argument("--layout", help="Overlay layout JSON file to auto-load on launch")
+    args, qt_args = parser.parse_known_args(sys.argv[1:])
+
+    app = QApplication([sys.argv[0]] + qt_args)
     app.setStyle("Fusion")
     window = MainWindow()
     window.show()
-    if len(sys.argv) > 1:
-        window.load_log_file(sys.argv[1])
+    if args.csv:
+        window.load_log_file(args.csv)
+    if args.layout:
+        window.load_layout_file(args.layout)
     sys.exit(app.exec())
