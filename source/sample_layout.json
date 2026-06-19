@@ -1,0 +1,92 @@
+[
+  {
+    "widget_type": "Lap Timer",
+    "x": 1413,
+    "y": 0,
+    "scale_x": 1.1818181818181819,
+    "scale_y": 1.1818181818181819,
+    "channel": "",
+    "label": "Lap Timer",
+    "min_val": 0.0,
+    "max_val": 100.0,
+    "color": [
+      0,
+      255,
+      0
+    ],
+    "show_value": true,
+    "selected": false
+  },
+  {
+    "widget_type": "Numeric Display",
+    "x": 1698,
+    "y": 900,
+    "scale_x": 1.24,
+    "scale_y": 1.24,
+    "channel": "GPS Speed",
+    "label": "MPH",
+    "min_val": 0.0,
+    "max_val": 100.0,
+    "color": [
+      0,
+      255,
+      0
+    ],
+    "show_value": true,
+    "selected": false
+  },
+  {
+    "widget_type": "Track Map",
+    "x": 1700,
+    "y": 0,
+    "scale_x": 1.0,
+    "scale_y": 1.0,
+    "channel": "",
+    "label": "Track Map",
+    "min_val": 0.0,
+    "max_val": 100.0,
+    "color": [
+      0,
+      255,
+      0
+    ],
+    "show_value": true,
+    "selected": false
+  },
+  {
+    "widget_type": "Bar Graph",
+    "x": 1220,
+    "y": 1020,
+    "scale_x": 3.5,
+    "scale_y": 1.0,
+    "channel": "RPM",
+    "label": "RPM",
+    "min_val": 0.0,
+    "max_val": 8094.8247,
+    "color": [
+      0,
+      0,
+      255
+    ],
+    "show_value": true,
+    "selected": false
+  },
+  {
+    "widget_type": "Bar Graph",
+    "x": 1220,
+    "y": 959,
+    "scale_x": 3.5,
+    "scale_y": 1.0,
+    "channel": "PEDAL POSITION",
+    "label": "THROTTLE",
+    "min_val": 0.0,
+    "max_val": 99.2124,
+    "color": [
+      127,
+      0,
+      0
+    ],
+    "show_value": false,
+    "selected": false
+  }
+]
