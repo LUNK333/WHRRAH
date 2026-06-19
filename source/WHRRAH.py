@@ -1114,6 +1114,16 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self.statusBar().showMessage("Load a data log to get started.")
 
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Space:
+            focus = QApplication.focusWidget()
+            # Don't hijack space while the user is typing/editing a control.
+            if not isinstance(focus, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox)):
+                self._on_play_clicked()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
     def _build_menu(self):
         mb = self.menuBar()
         file_menu = mb.addMenu("File")
@@ -1346,6 +1356,8 @@ class MainWindow(QMainWindow):
         self.canvas.widgets = [OverlayWidget.from_dict(d) for d in data]
         self.canvas.selected = None
         self.canvas.update()
+        self.props.load_widget(None)
+        self.btn_delete.setEnabled(False)
         self.statusBar().showMessage(f"Layout loaded from {path}")
 
     def export_video(self):
