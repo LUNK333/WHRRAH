@@ -9,6 +9,9 @@ import argparse
 import os
 import csv
 import json
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -22,11 +25,12 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox, QFormLayout, QProgressDialog,
     QMessageBox, QColorDialog
 )
-from PyQt6.QtCore import Qt, QRect, QPoint, QSize, QTimer, pyqtSignal, QThread, pyqtSignal as Signal
+from PyQt6.QtCore import Qt, QRect, QPoint, QSize, QTimer, QUrl, pyqtSignal, QThread, pyqtSignal as Signal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPixmap, QImage,
     QAction, QCursor
 )
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +295,10 @@ class OverlayWidget:
         self.show_best: bool = True
         self.show_lap: bool = True
         self.selected: bool = False
+        # Per-widget data-time offset, to compensate channels (e.g. CAN bus
+        # data) that lag behind GPS-derived ones without shifting the whole
+        # timeline/video sync. Positive = sample further ahead in the log.
+        self.time_offset: float = 0.0
 
     @property
     def base_size(self) -> tuple[int, int]:
@@ -368,6 +376,7 @@ class OverlayWidget:
 
     def render_to_frame(self, frame: np.ndarray, data_log: DataLog, time_sec: float):
         """Draw this widget onto a CV2 frame (BGR + alpha channel)."""
+        time_sec = time_sec + self.time_offset
         x, y, w, h = self.x, self.y, self.w, self.h
         color_bgr = self.color  # already BGR
 
@@ -397,7 +406,7 @@ class OverlayWidget:
 
         elif self.widget_type == "Track Map":
             if "GPS Latitude" in data_log.channels and "GPS Longitude" in data_log.channels:
-                _draw_track_map(frame, x, y, w, h, data_log, time_sec)
+                _draw_track_map(frame, x, y, w, h, data_log, time_sec, self.label, self.font_size, self.text_color)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +476,7 @@ def _draw_lap_timer(frame, x, y, w, h, lines, font_size, border_color, text_colo
         cv2.putText(frame, value, (x + 8 + label_w, ty), font, scale, text_color, 2, cv2.LINE_AA)
 
 
-def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float):
+def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label="", font_size=BASE_FONT_SIZE, text_color=(255, 255, 255)):
     lats = data_log.track_lat
     lons = data_log.track_lon
     if not lats or not lons:
@@ -486,6 +495,11 @@ def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float):
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
     cv2.rectangle(frame, (x, y), (x + w, y + h), (100, 100, 100), 2)
+
+    if label:
+        scale = font_size / 30.0
+        (_, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
+        cv2.putText(frame, label, (x + 8, y + 8 + label_h), cv2.FONT_HERSHEY_SIMPLEX, scale, text_color, 1, cv2.LINE_AA)
 
     # Draw track outline
     pts = [to_px(lat_arr[i], lon_arr[i]) for i in range(0, len(lat_arr), max(1, len(lat_arr) // 200))]
@@ -557,8 +571,12 @@ class OverlayCanvas(QWidget):
         self.setMinimumSize(640, 360)
         self.setMouseTracking(True)
         self._preview_time = 0.0
+        self._preview_progress_sec = 0.0
         self._data_log: DataLog | None = None
         self._preview_pixmap: QPixmap | None = None
+        self._video_cap: cv2.VideoCapture | None = None
+        self._video_offset = 0.0
+        self._video_last_msec = -1.0
 
     def set_resolution(self, w: int, h: int):
         self.overlay_width = w
@@ -568,9 +586,77 @@ class OverlayCanvas(QWidget):
     def set_data_log(self, dl: DataLog):
         self._data_log = dl
 
-    def set_preview_time(self, t: float):
+    def set_preview_time(self, t: float, progress_sec: float | None = None):
+        """t is the absolute data-log time, used to look up widget channel
+        values. progress_sec is the zero-based time since the start of the
+        selected lap range (or the whole log if no lap is selected) — that's
+        the basis the video offset is measured against, so dialing in an
+        offset means the same thing regardless of which lap you're viewing."""
         self._preview_time = t
+        self._preview_progress_sec = progress_sec if progress_sec is not None else t
         self.update()
+
+    def set_video(self, path: str | None):
+        """Loads a source video to preview behind the overlay, replacing the
+        green-screen fill, so positioning/offset can be judged against the
+        real footage instead of compositing in DaVinci first."""
+        if self._video_cap is not None:
+            self._video_cap.release()
+            self._video_cap = None
+        self._video_last_msec = -1.0
+        if path:
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                self._video_cap = cap
+        self.update()
+
+    def set_video_offset(self, offset_sec: float):
+        """offset_sec shifts the video relative to the preview timeline (the
+        zero-based progress since the start of the selected lap range): the
+        video frame shown at progress p is the one at video time (p - offset_sec).
+        Increasing the offset makes the video appear to lag further behind
+        (it pulls an earlier video frame forward to p)."""
+        self._video_offset = offset_sec
+        self.update()
+
+    def video_time_for(self, progress_sec: float) -> float:
+        return progress_sec - self._video_offset
+
+    # How far forward we'll walk via cheap sequential reads before giving up
+    # and seeking instead. A keyframe-seek on long-GOP/high-bitrate footage
+    # can cost 100ms+ per call (it has to locate the nearest keyframe and
+    # decode forward) versus ~a few ms for a plain sequential read, so during
+    # normal forward playback/scrubbing we want to avoid re-seeking every frame.
+    _MAX_SEQUENTIAL_READS = 30
+    _MAX_SEQUENTIAL_GAP_MS = 2000.0
+
+    def _video_frame_at(self, t: float) -> QImage | None:
+        if self._video_cap is None:
+            return None
+        target_msec = max(0.0, t) * 1000.0
+        delta = target_msec - self._video_last_msec
+        frame = None
+
+        if 0 <= delta <= self._MAX_SEQUENTIAL_GAP_MS:
+            for _ in range(self._MAX_SEQUENTIAL_READS):
+                ok, f = self._video_cap.read()
+                if not ok:
+                    break
+                frame = f
+                self._video_last_msec = self._video_cap.get(cv2.CAP_PROP_POS_MSEC)
+                if self._video_last_msec >= target_msec:
+                    break
+        else:
+            self._video_cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
+            ok, frame = self._video_cap.read()
+            if ok:
+                self._video_last_msec = self._video_cap.get(cv2.CAP_PROP_POS_MSEC)
+
+        if frame is None:
+            return None
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, _ = frame.shape
+        return QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
 
     def _scale(self) -> tuple[float, float, float, float]:
         """Returns (scale, offset_x, offset_y, scale) to map overlay coords to canvas."""
@@ -598,10 +684,19 @@ class OverlayCanvas(QWidget):
         ow = self.overlay_width * s
         oh = self.overlay_height * s
         painter.fillRect(0, 0, self.width(), self.height(), QColor(30, 30, 30))
-        painter.fillRect(int(ox), int(oy), int(ow), int(oh), QColor(0, 180, 0))
+        frame_rect = QRect(int(ox), int(oy), int(ow), int(oh))
+        qimg = self._video_frame_at(self.video_time_for(self._preview_progress_sec))
+        if qimg is not None:
+            painter.drawImage(frame_rect, qimg)
+        else:
+            painter.fillRect(frame_rect, QColor(0, 180, 0))
 
         # Draw each widget as a placeholder rectangle
         for w in self.widgets:
+            # Per-widget time offset compensates channels (e.g. CAN bus data)
+            # that lag behind GPS-derived ones — shifting this widget's own
+            # data lookup forward/back without touching the shared timeline.
+            wt = self._preview_time + w.time_offset
             tl = self._to_canvas(w.x, w.y)
             br = self._to_canvas(w.x + w.w, w.y + w.h)
             rect = QRect(tl, br)
@@ -617,7 +712,7 @@ class OverlayCanvas(QWidget):
             painter.drawRect(rect)
 
             if w.widget_type == "Track Map" and self._data_log:
-                layout = _track_map_layout(self._data_log, rect, self._preview_time)
+                layout = _track_map_layout(self._data_log, rect, wt)
                 if layout:
                     pts, dot = layout
                     track_pen = QPen(QColor(150, 150, 150))
@@ -631,7 +726,7 @@ class OverlayCanvas(QWidget):
                     painter.setBrush(Qt.BrushStyle.NoBrush)
 
             elif w.widget_type == "Bar Graph":
-                val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
+                val = self._data_log.value_at(w.channel, wt) if (self._data_log and w.channel) else 0.0
                 lo, hi = w.min_val, w.max_val
                 pct = max(0.0, min(1.0, (val - lo) / (hi - lo))) if hi != lo else 0.0
                 inner = rect.adjusted(3, 3, -3, -3)
@@ -651,7 +746,7 @@ class OverlayCanvas(QWidget):
                                  w.label)
             elif w.widget_type == "Lap Timer":
                 dl = self._data_log
-                t = self._preview_time
+                t = wt
                 lap_lines = []
                 if w.show_time:
                     lap_lines.append(("Time: ", _format_lap_clock(dl.lap_time_at(t)) if dl else "00:00:000"))
@@ -695,7 +790,7 @@ class OverlayCanvas(QWidget):
                 for i, (label, value) in enumerate(lap_lines):
                     draw_line(inner.y() + line_h * i, label, value)
             elif w.widget_type == "Bar Graph":
-                val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
+                val = self._data_log.value_at(w.channel, wt) if (self._data_log and w.channel) else 0.0
                 text = f"{w.label}: {val:.1f}" if w.show_value else w.label
                 inner = rect.adjusted(6, 6, -6, -6)
 
@@ -711,7 +806,7 @@ class OverlayCanvas(QWidget):
                 painter.setPen(QPen(QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)))
                 painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
             elif w.widget_type == "Numeric Display":
-                val = self._data_log.value_at(w.channel, self._preview_time) if (self._data_log and w.channel) else 0.0
+                val = self._data_log.value_at(w.channel, wt) if (self._data_log and w.channel) else 0.0
                 inner = rect.adjusted(8, 0, -4, 0)
 
                 # Box width is sized (in OverlayWidget.w) to fit the cv2-rendered
@@ -950,6 +1045,17 @@ class PropertiesPanel(QWidget):
         layout.addRow("Min:", self.spn_min)
         layout.addRow("Max:", self.spn_max)
 
+        # Shifts just this widget's data lookup — fixes channels (e.g. CAN
+        # bus data) that lag behind GPS-derived ones, without touching the
+        # shared scrubber timeline or video sync.
+        self.spn_time_offset = QDoubleSpinBox()
+        self.spn_time_offset.setRange(-10.0, 10.0)
+        self.spn_time_offset.setSingleStep(0.05)
+        self.spn_time_offset.setDecimals(2)
+        self.spn_time_offset.setSuffix(" s")
+        self.spn_time_offset.valueChanged.connect(self._on_time_offset)
+        layout.addRow("Time Offset:", self.spn_time_offset)
+
         self.chk_show_value.setVisible(False)
         self._set_row_visible(self.btn_color, False)
         self._set_row_visible(self.btn_text_color, False)
@@ -1010,6 +1116,7 @@ class PropertiesPanel(QWidget):
         self._set_row_visible(self.spn_scale_y, is_bar)
         self.spn_min.blockSignals(True); self.spn_min.setValue(w.min_val); self.spn_min.blockSignals(False)
         self.spn_max.blockSignals(True); self.spn_max.setValue(w.max_val); self.spn_max.blockSignals(False)
+        self.spn_time_offset.blockSignals(True); self.spn_time_offset.setValue(w.time_offset); self.spn_time_offset.blockSignals(False)
 
         self.cmb_channel.setEnabled(not no_channel)
         self.spn_min.setEnabled(not no_channel)
@@ -1105,6 +1212,92 @@ class PropertiesPanel(QWidget):
             self._widget.max_val = self.spn_max.value()
             self.changed.emit()
 
+    def _on_time_offset(self, value: float):
+        if self._widget:
+            self._widget.time_offset = value
+            self.changed.emit()
+
+
+# ---------------------------------------------------------------------------
+# Preview proxy thread
+# ---------------------------------------------------------------------------
+
+def find_ffmpeg() -> str | None:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    for candidate in (
+        r"C:\Program Files (x86)\MOZA Pit House\bin\ffmpeg.exe",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+    ):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+# Builds (vary quite a bit between bundled ffmpeg distributions — the GPL-only
+# libx264 isn't always present) are tried in this order, with the encoder-
+# specific flags each one actually understands. -g (GOP size) is the one flag
+# that matters for fixing seek lag and is supported across the board.
+_ENCODER_PREFERENCE = [
+    ("libx264", ["-preset", "veryfast", "-crf", "23", "-g", "30", "-keyint_min", "30", "-sc_threshold", "0"]),
+    ("h264_nvenc", ["-preset", "fast", "-b:v", "4M", "-g", "30"]),
+    ("h264_amf", ["-b:v", "4M", "-g", "30"]),
+    ("h264_qsv", ["-b:v", "4M", "-g", "30"]),
+    ("h264_mf", ["-b:v", "4M", "-g", "30"]),
+]
+
+
+def pick_video_encoder(ffmpeg_path: str) -> tuple[str, list[str]]:
+    """Picks the first usable H.264 encoder this ffmpeg build actually has."""
+    try:
+        result = subprocess.run([ffmpeg_path, "-hide_banner", "-encoders"],
+                                 capture_output=True, text=True, timeout=10)
+        available = result.stdout
+    except Exception:
+        available = ""
+    for name, args in _ENCODER_PREFERENCE:
+        if name in available:
+            return name, args
+    return _ENCODER_PREFERENCE[0]  # fall back and let ffmpeg report the error
+
+
+class ProxyThread(QThread):
+    """Transcodes a low-res, short-GOP copy of a source video for smooth
+    in-app preview. Camera/editor exports are often near-single-GOP (one
+    keyframe for the whole clip) at very high bitrate — great for quality,
+    terrible for scrubbing, since every seek has to decode forward from
+    that one keyframe. A small GOP fixes seeking; the lower resolution/
+    bitrate just makes each frame cheaper to decode."""
+
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, ffmpeg_path: str, src_path: str, dst_path: str, height: int = 540):
+        super().__init__()
+        self.ffmpeg_path = ffmpeg_path
+        self.src_path = src_path
+        self.dst_path = dst_path
+        self.height = height
+
+    def run(self):
+        try:
+            encoder, encoder_args = pick_video_encoder(self.ffmpeg_path)
+            cmd = [
+                self.ffmpeg_path, "-y", "-i", self.src_path,
+                "-vf", f"scale=-2:{self.height}",
+                "-c:v", encoder, *encoder_args,
+                "-c:a", "aac", "-b:a", "128k",
+                self.dst_path,
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.error.emit(result.stderr[-2000:])
+                return
+            self.finished.emit(self.dst_path)
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 # ---------------------------------------------------------------------------
 # Export thread
@@ -1112,13 +1305,15 @@ class PropertiesPanel(QWidget):
 
 class ExportThread(QThread):
     progress = Signal(int)
-    finished = Signal(str, str)  # (video_path, sync_file_path or "")
+    finished = Signal(str, str, str)  # (video_path, sync_file_path or "", audio_note or "")
     error = Signal(str)
     canceled = Signal()
 
     def __init__(self, widgets, data_log, fps, out_path,
                  lap_windows: list[tuple[float, float, list[tuple[int, float]]]] | None = None,
-                 write_sync_file: bool = False):
+                 write_sync_file: bool = False,
+                 video_path: str | None = None, video_offset: float = 0.0,
+                 output_size: tuple[int, int] | None = None):
         super().__init__()
         self.widgets = widgets
         self.data_log = data_log
@@ -1132,13 +1327,104 @@ class ExportThread(QThread):
             (data_log.timestamps[0], data_log.timestamps[-1], [(0, data_log.timestamps[0])])
         ]
         self.write_sync_file = write_sync_file
+        # video_path is the original full-quality source (never the low-lag
+        # proxy), composited in place of the green screen. video_offset uses
+        # the same zero-based-at-selection-start convention as the live
+        # preview, so whatever offset was dialed in there carries over exactly.
+        self.video_path = video_path
+        self.video_offset = video_offset
+        self.output_size = output_size
         self._cancel_requested = False
 
     def cancel(self):
         self._cancel_requested = True
 
+    # Mirrors OverlayCanvas._video_frame_at's sequential-read optimization —
+    # re-seeking every frame is what made the in-app preview laggy in the
+    # first place, and it's just as costly here.
+    _MAX_SEQUENTIAL_READS = 30
+    _MAX_SEQUENTIAL_GAP_MS = 2000.0
+
+    def _video_frame_at(self, cap, last_msec: float, target_msec: float, size: tuple[int, int]):
+        delta = target_msec - last_msec
+        frame = None
+        if 0 <= delta <= self._MAX_SEQUENTIAL_GAP_MS:
+            for _ in range(self._MAX_SEQUENTIAL_READS):
+                ok, f = cap.read()
+                if not ok:
+                    break
+                frame = f
+                last_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+                if last_msec >= target_msec:
+                    break
+        else:
+            cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
+            ok, frame = cap.read()
+            if ok:
+                last_msec = cap.get(cv2.CAP_PROP_POS_MSEC)
+        if frame is None:
+            return None, last_msec
+        return cv2.resize(frame, size), last_msec
+
+    def _mux_audio(self, silent_video_path: str) -> str:
+        """Pulls the matching audio out of the source video (trimmed/offset
+        the same way the video frames were) and muxes it into the rendered
+        file. cv2.VideoWriter can't write audio at all, so this is a
+        separate ffmpeg pass after the frames are written. Returns a warning
+        string if it couldn't be done (export still succeeds, just silent)."""
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            return "ffmpeg wasn't found, so the export has no audio. Install ffmpeg and put it on PATH to get audio."
+
+        tmp_dir = tempfile.mkdtemp(prefix="whrrah_audio_")
+        try:
+            segment_paths = []
+            progress_acc = 0.0
+            for start, end, _markers in self.lap_windows:
+                duration = end - start
+                audio_start = max(0.0, progress_acc - self.video_offset)
+                seg_path = os.path.join(tmp_dir, f"seg_{len(segment_paths)}.m4a")
+                result = subprocess.run(
+                    [ffmpeg_path, "-y", "-ss", f"{audio_start}", "-t", f"{duration}",
+                     "-i", self.video_path, "-vn", "-c:a", "aac", "-b:a", "192k", seg_path],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    return f"Couldn't extract audio for export: {result.stderr[-500:]}"
+                segment_paths.append(seg_path)
+                progress_acc += duration
+
+            if len(segment_paths) == 1:
+                audio_path = segment_paths[0]
+            else:
+                concat_list = os.path.join(tmp_dir, "concat.txt")
+                with open(concat_list, "w") as f:
+                    for p in segment_paths:
+                        f.write(f"file '{p}'\n")
+                audio_path = os.path.join(tmp_dir, "audio_concat.m4a")
+                result = subprocess.run(
+                    [ffmpeg_path, "-y", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", audio_path],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    return f"Couldn't join audio segments for export: {result.stderr[-500:]}"
+
+            muxed_path = silent_video_path + ".muxed.mp4"
+            result = subprocess.run(
+                [ffmpeg_path, "-y", "-i", silent_video_path, "-i", audio_path,
+                 "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-shortest", muxed_path],
+                capture_output=True, text=True
+            )
+            if result.returncode != 0:
+                return f"Couldn't mux audio into export: {result.stderr[-500:]}"
+            os.replace(muxed_path, silent_video_path)
+            return ""
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     def run(self):
         writer = None
+        video_cap = None
         try:
             dl = self.data_log
             frames_per_window = [max(0, int((end - start) * self.fps)) for start, end, _ in self.lap_windows]
@@ -1147,15 +1433,26 @@ class ExportThread(QThread):
                 self.error.emit("Selected laps have zero duration.")
                 return
 
-            # Determine resolution from first widget bounds or default
-            w_max = max((ww.x + ww.w for ww in self.widgets), default=1920)
-            h_max = max((ww.y + ww.h for ww in self.widgets), default=1080)
+            if self.video_path:
+                video_cap = cv2.VideoCapture(self.video_path)
+                if not video_cap.isOpened():
+                    self.error.emit(f"Could not open video for compositing:\n{self.video_path}")
+                    return
+                w_max, h_max = self.output_size or (1920, 1080)
+                video_last_msec = -1.0
+            else:
+                # No video loaded — fall back to the original green-screen
+                # behavior, sized to the widget bounds for chroma-keying.
+                w_max = max((ww.x + ww.w for ww in self.widgets), default=1920)
+                h_max = max((ww.y + ww.h for ww in self.widgets), default=1080)
 
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w_max, h_max))
 
-            green = np.zeros((h_max, w_max, 3), dtype=np.uint8)
-            green[:, :] = (0, 180, 0)  # pure BGR green screen
+            green = None
+            if video_cap is None:
+                green = np.zeros((h_max, w_max, 3), dtype=np.uint8)
+                green[:, :] = (0, 180, 0)  # pure BGR green screen
 
             done = 0
             sync_entries = []  # (lap_number, frame_idx, time_sec)
@@ -1174,7 +1471,20 @@ class ExportThread(QThread):
                         self.canceled.emit()
                         return
                     t = start + frame_idx / self.fps
-                    frame = green.copy()
+
+                    if video_cap is not None:
+                        # done/fps is the elapsed time along the concatenated,
+                        # zero-based render timeline — the exact same basis
+                        # the live preview's offset is measured against.
+                        progress_sec = done / self.fps
+                        target_msec = max(0.0, progress_sec - self.video_offset) * 1000.0
+                        frame, video_last_msec = self._video_frame_at(
+                            video_cap, video_last_msec, target_msec, (w_max, h_max))
+                        if frame is None:
+                            frame = np.zeros((h_max, w_max, 3), dtype=np.uint8)
+                    else:
+                        frame = green.copy()
+
                     for ww in self.widgets:
                         ww.render_to_frame(frame, dl, t)
                     writer.write(frame)
@@ -1183,6 +1493,13 @@ class ExportThread(QThread):
 
             writer.release()
             writer = None
+            if video_cap is not None:
+                video_cap.release()
+                video_cap = None
+
+            audio_note = ""
+            if self.video_path:
+                audio_note = self._mux_audio(self.out_path)
 
             sync_path = ""
             if self.write_sync_file:
@@ -1192,10 +1509,12 @@ class ExportThread(QThread):
                     for lap_number, frame_idx, time_sec in sync_entries:
                         f.write(f"Lap {lap_number}: frame {frame_idx}, time {_format_lap_clock(time_sec)}\n")
 
-            self.finished.emit(self.out_path, sync_path)
+            self.finished.emit(self.out_path, sync_path, audio_note)
         except Exception as e:
             if writer is not None:
                 writer.release()
+            if video_cap is not None:
+                video_cap.release()
             self.error.emit(str(e))
 
 
@@ -1270,10 +1589,12 @@ class LapTickBar(QWidget):
 class LapSelectDialog(QDialog):
     """Lets the user pick which laps to include in the exported video."""
 
-    def __init__(self, lap_ranges: list[tuple[int, float, float]], parent=None):
+    def __init__(self, lap_ranges: list[tuple[int, float, float]], parent=None,
+                 preselected: set[int] | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Select Laps to Export")
+        self.setWindowTitle("Select Laps")
         self._checkboxes: list[QCheckBox] = []
+        preselected = preselected or set()
 
         layout = QVBoxLayout(self)
 
@@ -1290,24 +1611,10 @@ class LapSelectDialog(QDialog):
         for lap_num, start, end in lap_ranges:
             item = QListWidgetItem(list_widget)
             chk = QCheckBox(f"Lap {lap_num}  ({_format_lap_clock(end - start)})")
-            chk.setChecked(True)
+            chk.setChecked(lap_num in preselected)
             self._checkboxes.append(chk)
             list_widget.setItemWidget(item, chk)
         layout.addWidget(list_widget)
-
-        pad_row = QHBoxLayout()
-        self.chk_pad = QCheckBox("Pad start/end of each lap by")
-        self.spn_pad = QDoubleSpinBox()
-        self.spn_pad.setRange(0.0, 120.0)
-        self.spn_pad.setSingleStep(1.0)
-        self.spn_pad.setValue(10.0)
-        self.spn_pad.setSuffix(" s")
-        self.spn_pad.setEnabled(False)
-        self.chk_pad.toggled.connect(self.spn_pad.setEnabled)
-        pad_row.addWidget(self.chk_pad)
-        pad_row.addWidget(self.spn_pad)
-        pad_row.addStretch()
-        layout.addLayout(pad_row)
 
         self.chk_sync_file = QCheckBox("Generate sync .txt file (frame/timestamp at each lap start)")
         layout.addWidget(self.chk_sync_file)
@@ -1320,9 +1627,6 @@ class LapSelectDialog(QDialog):
     def _set_all(self, checked: bool):
         for chk in self._checkboxes:
             chk.setChecked(checked)
-
-    def pad_seconds(self) -> float:
-        return self.spn_pad.value() if self.chk_pad.isChecked() else 0.0
 
     def sync_file_enabled(self) -> bool:
         return self.chk_sync_file.isChecked()
@@ -1342,9 +1646,25 @@ class MainWindow(QMainWindow):
         self.resize(1400, 800)
         self.data_log = DataLog()
         self.lap_starts: list[float] = []
+        self._lap_selection_indices: set[int] = set()
+        self._lap_pad_start = 0.0
+        self._lap_pad_end = 0.0
+        self._write_sync_file = False
+        self._lap_windows_for_export: list[tuple[float, float, list[tuple[int, float]]]] | None = None
+        self._preview_windows: list[tuple[float, float]] = []  # restricted scrub/preview range; empty = full log
+        self._preview_progress_sec = 0.0
+        self._source_video_path: str | None = None
+        self.media_player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.audio_output.setVolume(0.7)
+        self.media_player.setAudioOutput(self.audio_output)
         self._build_ui()
         self._build_menu()
         self.statusBar().showMessage("Load a data log to get started.")
+
+        default_layout_path = Path(__file__).parent / "default_layout.json"
+        if default_layout_path.exists():
+            self.load_layout_file(str(default_layout_path))
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:
@@ -1381,7 +1701,7 @@ class MainWindow(QMainWindow):
         file_menu.addAction(act_quit)
 
         export_menu = mb.addMenu("Export")
-        act_export = QAction("Export Green Screen Video…", self)
+        act_export = QAction("Export Video…", self)
         act_export.setShortcut("Ctrl+E")
         act_export.triggered.connect(self.export_video)
         export_menu.addAction(act_export)
@@ -1395,14 +1715,56 @@ class MainWindow(QMainWindow):
         left = QWidget(); left.setFixedWidth(200)
         left_layout = QVBoxLayout(left)
 
-        grp_log = QGroupBox("Data Log")
+        grp_log = QGroupBox("Data")
         ll = QVBoxLayout(grp_log)
         self.btn_open_log = QPushButton("Open CSV…")
         self.btn_open_log.clicked.connect(self.open_log)
         self.lbl_log = QLabel("No log loaded")
-        self.lbl_log.setWordWrap(True)
+        self.lbl_log.setWordWrap(False)
+        self.btn_select_laps = QPushButton("Select Laps…")
+        self.btn_select_laps.clicked.connect(self.open_lap_select)
+        self.lbl_lap_selection = QLabel("No laps selected")
+        self.lbl_lap_selection.setWordWrap(True)
+        pad_row = QFormLayout()
+        self.spn_pad_start = QDoubleSpinBox()
+        self.spn_pad_start.setRange(0.0, 120.0)
+        self.spn_pad_start.setSingleStep(1.0)
+        self.spn_pad_start.setSuffix(" s")
+        self.spn_pad_start.valueChanged.connect(self._on_pad_changed)
+        self.spn_pad_end = QDoubleSpinBox()
+        self.spn_pad_end.setRange(0.0, 120.0)
+        self.spn_pad_end.setSingleStep(1.0)
+        self.spn_pad_end.setSuffix(" s")
+        self.spn_pad_end.valueChanged.connect(self._on_pad_changed)
+        pad_row.addRow("Pad Start:", self.spn_pad_start)
+        pad_row.addRow("Pad End:", self.spn_pad_end)
         ll.addWidget(self.btn_open_log)
         ll.addWidget(self.lbl_log)
+        ll.addWidget(self.btn_select_laps)
+        ll.addWidget(self.lbl_lap_selection)
+        ll.addLayout(pad_row)
+
+        grp_video = QGroupBox("Video")
+        vl = QVBoxLayout(grp_video)
+        self.btn_open_video = QPushButton("Open Video…")
+        self.btn_open_video.clicked.connect(self.open_video)
+        self.lbl_video = QLabel("No video loaded")
+        self.lbl_video.setWordWrap(True)
+        self.btn_make_proxy = QPushButton("Make Low-Lag Preview…")
+        self.btn_make_proxy.setEnabled(False)
+        self.btn_make_proxy.clicked.connect(self.make_proxy_video)
+        offset_row = QFormLayout()
+        self.spn_video_offset = QDoubleSpinBox()
+        self.spn_video_offset.setRange(-3600.0, 3600.0)
+        self.spn_video_offset.setDecimals(2)
+        self.spn_video_offset.setSingleStep(0.1)
+        self.spn_video_offset.setSuffix(" s")
+        self.spn_video_offset.valueChanged.connect(self._on_video_offset_changed)
+        offset_row.addRow("Offset:", self.spn_video_offset)
+        vl.addWidget(self.btn_open_video)
+        vl.addWidget(self.lbl_video)
+        vl.addWidget(self.btn_make_proxy)
+        vl.addLayout(offset_row)
 
         grp_layout = QGroupBox("Layout")
         lyl = QVBoxLayout(grp_layout)
@@ -1435,10 +1797,14 @@ class MainWindow(QMainWindow):
 
         grp_fps = QGroupBox("Export FPS")
         fl = QFormLayout(grp_fps)
-        self.spn_fps = QSpinBox(); self.spn_fps.setRange(1, 120); self.spn_fps.setValue(30)
+        self.spn_fps = QDoubleSpinBox()
+        self.spn_fps.setRange(1.0, 120.0)
+        self.spn_fps.setDecimals(2)
+        self.spn_fps.setValue(30.0)
         fl.addRow("FPS:", self.spn_fps)
 
         left_layout.addWidget(grp_log)
+        left_layout.addWidget(grp_video)
         left_layout.addWidget(grp_layout)
         left_layout.addWidget(grp_widgets)
         left_layout.addWidget(self.btn_delete)
@@ -1481,15 +1847,21 @@ class MainWindow(QMainWindow):
         scrub_row.addWidget(QLabel("Preview:"))
         scrub_row.addLayout(scrub_col, 1)
         scrub_row.addWidget(self.lbl_time)
+        scrub_row.addWidget(QLabel("🔊"))
+        self.sld_volume = QSlider(Qt.Orientation.Horizontal)
+        self.sld_volume.setFixedWidth(80)
+        self.sld_volume.setRange(0, 100)
+        self.sld_volume.setValue(70)
+        self.sld_volume.valueChanged.connect(self._on_volume_changed)
+        scrub_row.addWidget(self.sld_volume)
         ccl.addLayout(scrub_row)
 
         self.playback_speed = 1.0
-        self._current_t = 0.0
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(33)  # ~30 ticks/sec
         self._play_timer.timeout.connect(self._on_play_tick)
 
-        btn_export = QPushButton("🎬  Export Green Screen Video…")
+        btn_export = QPushButton("🎬  Export Video…")
         btn_export.setFixedHeight(40)
         btn_export.clicked.connect(self.export_video)
         ccl.addWidget(btn_export)
@@ -1505,54 +1877,127 @@ class MainWindow(QMainWindow):
         self.props.load_widget(w)
         self.btn_delete.setEnabled(w is not None)
 
-    def _on_scrub(self, val):
-        if self.data_log.duration > 0:
-            t = self.data_log.timestamps[0] + val / 1000.0 * self.data_log.duration
-            self._current_t = t
-            self.canvas.set_preview_time(t)
-            self.lbl_time.setText(f"{t:.2f} s")
+    def _preview_windows_or_full(self) -> list[tuple[float, float]]:
+        """The (start, end) ranges the scrubber/preview should move through —
+        the lap-selected windows if any, otherwise the whole log."""
+        if self._preview_windows:
+            return self._preview_windows
+        if self.data_log.timestamps:
+            return [(self.data_log.timestamps[0], self.data_log.timestamps[-1])]
+        return []
 
-    def _on_lap_tick_clicked(self, t: float):
-        if self.data_log.duration > 0:
-            val = int((t - self.data_log.timestamps[0]) / self.data_log.duration * 1000)
+    def _preview_total_duration(self) -> float:
+        return sum(e - s for s, e in self._preview_windows_or_full())
+
+    def _progress_seconds_to_time(self, progress_sec: float) -> float:
+        """Maps seconds-along-the-concatenated-preview-timeline to an absolute
+        data-log time, skipping over any gaps between non-adjacent lap windows."""
+        windows = self._preview_windows_or_full()
+        if not windows:
+            return self.data_log.timestamps[0] if self.data_log.timestamps else 0.0
+        acc = 0.0
+        for s, e in windows:
+            seg = e - s
+            if progress_sec <= acc + seg or seg <= 0:
+                return s + (progress_sec - acc)
+            acc += seg
+        return windows[-1][1]
+
+    def _time_to_progress_seconds(self, t: float) -> float:
+        """Inverse of _progress_seconds_to_time, for placing lap ticks and
+        for resuming playback from wherever the scrubber currently sits."""
+        windows = self._preview_windows_or_full()
+        if not windows:
+            return 0.0
+        acc = 0.0
+        for s, e in windows:
+            if s <= t <= e:
+                return acc + (t - s)
+            acc += e - s
+        return 0.0 if t < windows[0][0] else acc
+
+    def _refresh_lap_ticks(self):
+        total = self._preview_total_duration()
+        windows = self._preview_windows_or_full()
+        ticks = [self._time_to_progress_seconds(s) for s in self.lap_starts
+                 if any(ws <= s <= we for ws, we in windows)]
+        self.lap_ticks.set_markers(ticks, 0.0, total)
+
+    def _on_scrub(self, val):
+        total = self._preview_total_duration()
+        if total > 0:
+            self._preview_progress_sec = val / 1000.0 * total
+            t = self._progress_seconds_to_time(self._preview_progress_sec)
+            self.canvas.set_preview_time(t, self._preview_progress_sec)
+            self.lbl_time.setText(f"{self._preview_progress_sec:.2f} s")
+            self._sync_audio_position(self._preview_progress_sec)
+
+    def _on_lap_tick_clicked(self, progress_sec: float):
+        total = self._preview_total_duration()
+        if total > 0:
+            val = int(progress_sec / total * 1000)
             self.scrubber.setValue(max(0, min(1000, val)))
 
     def _on_speed_changed(self, text):
         self.playback_speed = float(text.rstrip("x"))
+        if self._play_timer.isActive():
+            self.media_player.setPlaybackRate(self.playback_speed)
+
+    def _sync_audio_position(self, progress_sec: float):
+        if self.media_player.source().isEmpty():
+            return
+        self.media_player.setPosition(int(self.canvas.video_time_for(progress_sec) * 1000))
 
     def _on_play_clicked(self):
         if self._play_timer.isActive():
             self._play_timer.stop()
             self.btn_play.setText("▶")
+            self.media_player.pause()
         else:
-            if self.data_log.duration <= 0:
+            total = self._preview_total_duration()
+            if total <= 0:
                 return
-            # Seed the float time tracker from wherever the slider currently is,
-            # since the slider's integer resolution is too coarse to advance by
-            # for long logs (a single unit can be many real-time seconds).
-            self._current_t = self.data_log.timestamps[0] + self.scrubber.value() / 1000.0 * self.data_log.duration
+            # Seed the float progress tracker from wherever the slider currently
+            # is, since the slider's integer resolution is too coarse to advance
+            # by for long logs (a single unit can be many real-time seconds).
+            self._preview_progress_sec = self.scrubber.value() / 1000.0 * total
             self._play_timer.start()
             self.btn_play.setText("⏸")
+            if not self.media_player.source().isEmpty():
+                self.media_player.setPlaybackRate(self.playback_speed)
+                self._sync_audio_position(self._preview_progress_sec)
+                self.media_player.play()
 
     def _on_play_tick(self):
-        if self.data_log.duration <= 0:
+        total = self._preview_total_duration()
+        if total <= 0:
             self._play_timer.stop()
             self.btn_play.setText("▶")
             return
         step = self._play_timer.interval() / 1000.0 * self.playback_speed
-        t_end = self.data_log.timestamps[-1]
-        self._current_t = min(self._current_t + step, t_end)
+        self._preview_progress_sec = min(self._preview_progress_sec + step, total)
+        t = self._progress_seconds_to_time(self._preview_progress_sec)
 
-        val = int((self._current_t - self.data_log.timestamps[0]) / self.data_log.duration * 1000)
+        val = int(self._preview_progress_sec / total * 1000)
         self.scrubber.blockSignals(True)
         self.scrubber.setValue(val)
         self.scrubber.blockSignals(False)
-        self.canvas.set_preview_time(self._current_t)
-        self.lbl_time.setText(f"{self._current_t:.2f} s")
+        self.canvas.set_preview_time(t, self._preview_progress_sec)
+        self.lbl_time.setText(f"{self._preview_progress_sec:.2f} s")
 
-        if self._current_t >= t_end:
+        # The preview clock and the media player's internal clock drift apart
+        # over time (they're independent timers) — nudge the audio back in
+        # line once it's noticeably off rather than resyncing every tick.
+        if not self.media_player.source().isEmpty():
+            expected_ms = self.canvas.video_time_for(self._preview_progress_sec) * 1000
+            if abs(self.media_player.position() - expected_ms) > 200:
+                self.media_player.setPosition(int(expected_ms))
+
+        if self._preview_progress_sec >= total:
             self._play_timer.stop()
             self.btn_play.setText("▶")
+            self.media_player.pause()
+            self.media_player.pause()
 
     def canvas_delete(self):
         self.canvas.delete_selected()
@@ -1567,18 +2012,243 @@ class MainWindow(QMainWindow):
         try:
             channels = self.data_log.load(path)
             self.canvas.set_data_log(self.data_log)
-            self.lbl_log.setText(f"{Path(path).name}\n{len(channels)} channels\n{self.data_log.duration:.1f}s")
             self.props.set_channels(channels)
             self.props.set_data_log(self.data_log)
 
             t0 = self.data_log.timestamps[0] if self.data_log.timestamps else 0.0
             t_end = self.data_log.timestamps[-1] if self.data_log.timestamps else 0.0
             self.lap_starts = [t0] + [m for m in self.data_log.beacon_markers if m < t_end]
-            self.lap_ticks.set_markers(self.lap_starts, t0, self.data_log.duration)
+
+            # Completed laps only — the segment still in progress at t_end (if
+            # any) doesn't count toward the lap total or the best-lap search.
+            total_laps = self.data_log.lap_number_at(t_end) if self.data_log.timestamps else 0
+            lap_durations = [(n, d) for n in range(total_laps)
+                              if (d := self.data_log.lap_duration(n)) is not None]
+            if lap_durations:
+                best_lap_num, best_time = min(lap_durations, key=lambda x: x[1])
+                best_str = f"Best: Lap {best_lap_num} ({_format_lap_clock(best_time)})"
+            else:
+                best_str = "Best: —"
+
+            elided_name = self.lbl_log.fontMetrics().elidedText(
+                Path(path).name, Qt.TextElideMode.ElideRight, 170)
+            self.lbl_log.setText(
+                f"{elided_name}\n"
+                f"{len(channels)} channels\n"
+                f"Length: {_format_lap_clock(self.data_log.duration)}\n"
+                f"Laps: {total_laps}\n"
+                f"{best_str}"
+            )
+
+            # A new log invalidates any previous lap selection — default back
+            # to no laps selected / full-range preview until the user picks again.
+            self._lap_selection_indices = set()
+            self._lap_windows_for_export = None
+            self._preview_windows = []
+            self.lbl_lap_selection.setText("No laps selected")
+            self._refresh_lap_ticks()
+            self.scrubber.blockSignals(True)
+            self.scrubber.setValue(0)
+            self.scrubber.blockSignals(False)
+            self._on_scrub(0)
 
             self.statusBar().showMessage(f"Loaded {len(channels)} channels, {self.data_log.duration:.1f}s duration")
         except Exception as e:
             QMessageBox.critical(self, "Load Error", str(e))
+
+    def _lap_ranges(self) -> list[tuple[int, float, float]]:
+        t_end = self.data_log.timestamps[-1] if self.data_log.timestamps else 0.0
+        return [
+            (i, start, self.lap_starts[i + 1] if i + 1 < len(self.lap_starts) else t_end)
+            for i, start in enumerate(self.lap_starts)
+        ]
+
+    def open_lap_select(self):
+        if not self.lap_starts or self.data_log.duration <= 0:
+            QMessageBox.information(self, "No Laps", "Load a data log with lap markers first.")
+            return
+        lap_ranges = self._lap_ranges()
+        dialog = LapSelectDialog(lap_ranges, self, preselected=self._lap_selection_indices)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        selected = dialog.selected_indices()
+        if not selected:
+            QMessageBox.warning(self, "No Laps Selected",
+                                 "Select at least one lap, or Cancel to leave the current selection unchanged.")
+            return
+        self._apply_lap_selection(lap_ranges, selected, self.spn_pad_start.value(), self.spn_pad_end.value(),
+                                   dialog.sync_file_enabled())
+
+    def _on_pad_changed(self):
+        # Live-reapply if a selection is already active, the same way the
+        # video offset re-renders the preview without reopening a dialog.
+        if not self._lap_selection_indices:
+            return
+        self._apply_lap_selection(self._lap_ranges(), sorted(self._lap_selection_indices),
+                                   self.spn_pad_start.value(), self.spn_pad_end.value(), self._write_sync_file)
+
+    def _video_duration_sec(self) -> float | None:
+        """Reads the original source video's duration (never the low-lag
+        proxy — it's the same length, but this is the authoritative file
+        export actually uses)."""
+        if not self._source_video_path:
+            return None
+        cap = cv2.VideoCapture(self._source_video_path)
+        try:
+            if not cap.isOpened():
+                return None
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            return frame_count / fps if fps > 0 and frame_count > 0 else None
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _clamp_windows_to_video(lap_windows, video_offset: float, video_duration: float):
+        """Trims (start, end, markers) windows so the video lookup they imply
+        — video_time = progress - offset — never asks for footage outside
+        [0, video_duration]. Without this, a lap selection padded past the
+        end of the recording silently truncates the exported video to match
+        whatever audio ffmpeg could find instead of erroring or warning."""
+        progress_min = max(0.0, video_offset)
+        progress_max = video_duration + video_offset
+
+        clamped = []
+        progress = 0.0
+        trimmed = 0.0
+        for start, end, markers in lap_windows:
+            win_progress_start = progress
+            win_progress_end = progress + (end - start)
+            progress = win_progress_end
+
+            clipped_start = max(win_progress_start, progress_min)
+            clipped_end = min(win_progress_end, progress_max)
+            if clipped_end <= clipped_start:
+                trimmed += end - start
+                continue
+            new_start = start + (clipped_start - win_progress_start)
+            new_end = start + (clipped_end - win_progress_start)
+            trimmed += (end - start) - (new_end - new_start)
+            kept_markers = [(n, t) for n, t in markers if new_start <= t <= new_end]
+            clamped.append((new_start, new_end, kept_markers))
+        return clamped, trimmed
+
+    def _apply_lap_selection(self, lap_ranges, selected: list[int], pad_start: float, pad_end: float,
+                              write_sync_file: bool):
+        self._lap_selection_indices = set(selected)
+        self._lap_pad_start = pad_start
+        self._lap_pad_end = pad_end
+        self._write_sync_file = write_sync_file
+
+        t0 = self.data_log.timestamps[0]
+        t_end = self.data_log.timestamps[-1]
+
+        # Group contiguous selected laps (e.g. 2 and 3) into one window so
+        # padding only lands before the first and after the last lap of a
+        # run, not in the gap between adjacent laps.
+        ordered = sorted(selected)
+        groups = [[ordered[0]]]
+        for idx in ordered[1:]:
+            if idx == groups[-1][-1] + 1:
+                groups[-1].append(idx)
+            else:
+                groups.append([idx])
+
+        lap_windows = []
+        for group in groups:
+            start = max(t0, lap_ranges[group[0]][1] - pad_start)
+            end = min(t_end, lap_ranges[group[-1]][2] + pad_end)
+            lap_windows.append((start, end, [(lap_ranges[i][0], lap_ranges[i][1]) for i in group]))
+
+        video_duration = self._video_duration_sec()
+        if video_duration is not None:
+            lap_windows, trimmed = self._clamp_windows_to_video(
+                lap_windows, self.spn_video_offset.value(), video_duration)
+            if trimmed > 0.05:
+                QMessageBox.warning(
+                    self, "Selection Extends Past Video",
+                    f"The selected laps (with padding) cover {trimmed:.1f}s more than the loaded "
+                    "video has footage for, given the current offset. That portion has been trimmed "
+                    "from the selection rather than exported with no audio/video."
+                )
+            if not lap_windows:
+                QMessageBox.warning(self, "No Footage In Range",
+                                     "None of the selected laps overlap the loaded video at the current offset.")
+                return
+
+        self._preview_windows = [(s, e) for s, e, _ in lap_windows]
+        self._lap_windows_for_export = lap_windows
+        self._refresh_lap_ticks()
+
+        lap_nums = ", ".join(str(lap_ranges[i][0]) for i in ordered)
+        self.lbl_lap_selection.setText(f"Laps: {lap_nums}")
+
+        self.scrubber.blockSignals(True)
+        self.scrubber.setValue(0)
+        self.scrubber.blockSignals(False)
+        self._on_scrub(0)
+
+    def open_video(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Video", "", "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*)")
+        if not path:
+            return
+        self._load_video(path, is_proxy=False)
+
+    def _load_video(self, path: str, is_proxy: bool):
+        self.canvas.set_video(path)
+        if self.canvas._video_cap is None:
+            QMessageBox.critical(self, "Load Error", f"Could not open video:\n{path}")
+            self.lbl_video.setText("No video loaded")
+            self.btn_make_proxy.setEnabled(False)
+            return
+        if not is_proxy:
+            self._source_video_path = path
+            video_fps = self.canvas._video_cap.get(cv2.CAP_PROP_FPS)
+            if video_fps > 0:
+                self.spn_fps.setValue(video_fps)
+        suffix = " (low-lag preview)" if is_proxy else ""
+        self.lbl_video.setText(Path(path).name + suffix)
+        self.canvas.set_video_offset(self.spn_video_offset.value())
+        self.media_player.setSource(QUrl.fromLocalFile(path))
+        self.btn_make_proxy.setEnabled(not is_proxy)
+
+    def make_proxy_video(self):
+        src = self._source_video_path
+        if not src:
+            return
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            QMessageBox.critical(
+                self, "ffmpeg Not Found",
+                "Couldn't find ffmpeg on this machine, so a low-lag preview can't be generated.\n\n"
+                "Install ffmpeg and make sure it's on PATH, then try again."
+            )
+            return
+
+        dst = str(Path(src).with_name(Path(src).stem + "_preview.mp4"))
+        progress = QProgressDialog("Generating low-lag preview…", None, 0, 0, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.show()
+
+        self._proxy_thread = ProxyThread(ffmpeg_path, src, dst)
+        self._proxy_thread.finished.connect(lambda dst_path: (
+            progress.close(),
+            self._load_video(dst_path, is_proxy=True),
+            self.statusBar().showMessage(f"Low-lag preview ready: {dst_path}")
+        ))
+        self._proxy_thread.error.connect(lambda e: (
+            progress.close(),
+            QMessageBox.critical(self, "Proxy Generation Failed", e)
+        ))
+        self._proxy_thread.start()
+
+    def _on_video_offset_changed(self, value: float):
+        self.canvas.set_video_offset(value)
+
+    def _on_volume_changed(self, value: int):
+        self.audio_output.setVolume(value / 100.0)
 
     def save_layout(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Layout", "", "JSON (*.json)")
@@ -1619,43 +2289,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Widgets", "Add at least one widget before exporting.")
             return
 
-        t0 = self.data_log.timestamps[0]
-        t_end = self.data_log.timestamps[-1]
-        lap_ranges = [
-            (i, start, self.lap_starts[i + 1] if i + 1 < len(self.lap_starts) else t_end)
-            for i, start in enumerate(self.lap_starts)
-        ]
-
-        lap_windows = None
-        write_sync_file = False
-        if lap_ranges:
-            lap_dialog = LapSelectDialog(lap_ranges, self)
-            if lap_dialog.exec() != QDialog.DialogCode.Accepted:
-                return
-            selected = lap_dialog.selected_indices()
-            if not selected:
-                QMessageBox.warning(self, "No Laps Selected", "Select at least one lap to export.")
-                return
-            pad = lap_dialog.pad_seconds()
-            write_sync_file = lap_dialog.sync_file_enabled()
-
-            # Group contiguous selected laps (e.g. 2 and 3) into one render
-            # window so padding only lands before the first and after the
-            # last lap of the run, not in between adjacent laps.
-            selected = sorted(selected)
-            groups = [[selected[0]]]
-            for idx in selected[1:]:
-                if idx == groups[-1][-1] + 1:
-                    groups[-1].append(idx)
-                else:
-                    groups.append([idx])
-
-            lap_windows = []
-            for group in groups:
-                group_start = lap_ranges[group[0]][1]
-                group_end = lap_ranges[group[-1]][2]
-                markers = [(lap_ranges[i][0], lap_ranges[i][1]) for i in group]
-                lap_windows.append((max(t0, group_start - pad), min(t_end, group_end + pad), markers))
+        if self.lap_starts and self._lap_windows_for_export is None:
+            QMessageBox.warning(self, "No Laps Selected",
+                                 "Use the \"Select Laps…\" button in the sidebar to choose which laps to export.")
+            return
 
         path, _ = QFileDialog.getSaveFileName(self, "Export Video", "overlay.mp4", "MP4 Video (*.mp4)")
         if not path:
@@ -1666,15 +2303,21 @@ class MainWindow(QMainWindow):
         progress.show()
 
         self._export_thread = ExportThread(
-            self.canvas.widgets, self.data_log, self.spn_fps.value(), path, lap_windows, write_sync_file
+            self.canvas.widgets, self.data_log, self.spn_fps.value(), path,
+            self._lap_windows_for_export, self._write_sync_file,
+            video_path=self._source_video_path,
+            video_offset=self.spn_video_offset.value(),
+            output_size=(self.spn_res_w.value(), self.spn_res_h.value()),
         )
         progress.canceled.connect(self._export_thread.cancel)
         self._export_thread.progress.connect(progress.setValue)
-        self._export_thread.finished.connect(lambda video_path, sync_path: (
+        self._export_thread.finished.connect(lambda video_path, sync_path, audio_note: (
             progress.close(),
             QMessageBox.information(
                 self, "Done",
-                f"Exported to:\n{video_path}" + (f"\n\nSync file:\n{sync_path}" if sync_path else "")
+                f"Exported to:\n{video_path}"
+                + (f"\n\nSync file:\n{sync_path}" if sync_path else "")
+                + (f"\n\nNote: {audio_note}" if audio_note else "")
             )
         ))
         self._export_thread.error.connect(lambda e: (
