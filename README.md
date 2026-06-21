@@ -1,10 +1,11 @@
 # We Have RaceRender At Home
 
-A data overlay tool for AiM Solo2DL data logs. Lay out widgets (lap timer,
-numeric readouts, bar graphs, GPS track map) on a canvas, preview them
-against your data *and* your actual race footage, dial in sync, then export —
-either composited directly onto your video (with audio) or as a green-screen
-overlay to key out in DaVinci Resolve.
+A data overlay tool for AiM data logs (CSV or native `.xrk`). Lay out widgets
+(lap timer, numeric readouts, bar graphs, GPS track map) on a canvas, preview
+them against your data *and* your actual race footage, dial in sync — or let
+the **Data Wizard** find and sync the pairing for you — then export, either
+composited directly onto your video or as a green-screen overlay
+to key out in another video editor.
 
 ## Setup
 
@@ -15,12 +16,22 @@ python source/WHRRAH.py
 
 Requires Python 3.10+ (uses modern type-hint syntax).
 
-**ffmpeg is optional but recommended** — it's used for two things: generating
-a low-lag preview proxy for laggy source footage, and muxing audio into a
-composited export. The app looks for `ffmpeg` on PATH (falls back to a couple
-of common Windows install locations). Without it, everything else still
-works; composited exports just come out silent and you won't have the
-low-lag preview option.
+**ffmpeg is optional but recommended** — it's used for three things: generating
+a low-lag preview proxy for laggy source footage, muxing audio into a
+composited export, and the Data Wizard's gyro-based sync matching for DJI
+footage. The app looks for `ffmpeg` on PATH (falls back to a couple of common
+Windows install locations). Without it, everything else still works;
+composited exports just come out silent, you won't have the low-lag preview
+option, and wizard matching falls back to coarse EXIF-timestamp matching.
+
+**`.xrk` support requires `source/xrk_dll/`** (bundled in this repo) — a small
+wrapper around AiM's official `MatLabXRK` DLL. This is Windows-only; CSV logs work everywhere.
+
+Export text (Lap Timer, Numeric Display, Bar Graph, Track Map label) is rendered
+via Pillow using a monospace TTF (Consolas, falling back to Courier New) rather
+than OpenCV's built-in font — it's a much closer visual match to the live
+preview's Qt "Monospace" font, and widget box sizes are measured from this same
+font so the export and the preview agree.
 
 ### Launch arguments
 
@@ -31,58 +42,82 @@ python source/WHRRAH.py path/to/log.csv
 python source/WHRRAH.py path/to/log.csv --layout path/to/layout.json
 ```
 
-The CSV argument is optional and positional; `--layout` is optional and also
-loads a saved widget layout on launch (see [Saving and loading layouts](#saving-and-loading-layouts)).
-
-If `source/default_layout.json` exists, it's loaded automatically on startup
-(before any `--layout` argument, which takes priority over it).
+`source/default_layout.json` is loaded automatically on startup if it exists.
 
 ## Importing data
 
-Use **File → Open Data Log (.csv)…** (`Ctrl+O`) or the **Open CSV…** button in
-the **Data** group in the left sidebar, and pick an AiM RS2-exported CSV (see
-`source/sample_data.csv` for an example). The app reads:
+Use **File → Open Data Log (.csv/.xrk)…** (`Ctrl+O`), or the **Open CSV…** /
+**Open XRK…** buttons in the **Data** group in the left sidebar.
 
-- The **header row** (`"Time","GPS Speed",...`) and the channel data beneath it —
-  every numeric column becomes a selectable channel.
-- The **`Beacon Markers`** metadata row, which the log exports with the absolute
-  time (in seconds) of each lap/segment crossing. This is what drives the Lap
-  Timer, lap selection, and the lap tick marks on the scrubber — without it,
-  lap-based features fall back to treating the whole log as one lap.
+- **CSV** — an AiM RS2-exported CSV (see `source/sample_data.csv` for an
+  example). The app reads the **header row** (`"Time","GPS Speed",...`) for
+  channel names, and the **`Beacon Markers`** metadata row (absolute time in
+  seconds of each lap/segment crossing) for lap timing — without it, lap-based
+  features fall back to treating the whole log as one lap.
+- **XRK** — AiM's native RaceStudio 3 format, read directly via the bundled DLL (see
+  [Setup](#setup)).
 
-Once loaded, the **Data** group shows the (elided) filename, channel count,
+Once loaded, the **Data** group shows the filename, channel count,
 log length as `mm:ss:ms`, total completed laps, and the best lap's number and
 time.
+
+## The Data Wizard
+
+Click **📋 Data Wizard…** at the top of the sidebar to point the app at a
+folder of AiM sessions and a folder of video files, and have it figure out
+which video goes with which session — and how far into the session each video
+starts — automatically.
+
+- **Browse…** for the AiM data folder (scans for `.xrk` files) and the video
+  folder (`.mp4`/`.mov`/`.avi`/`.mkv`).
+- **Find Matches** runs in the background and scores every plausible
+  session/video pairing:
+  - **Gyro correlation** When the video files have gyro data embedded, this function
+    cross-correlates the video's gyro signal against the
+    AiM's gyro signal, and syncs the video to the session using this signal. A confidence score
+    is displayed showing how good the match is.
+	-DJI Osmo Action cameras that I have tested this with will record gyro data when the FoV is set to Wide, 
+	 and internal video stabilization features are disabled.
+  - **EXIF `creation_time`** as a fallback when gyro data isn't available.
+- The results table shows `AiM Session | Video | Laps | Best Lap | Confidence | [Load]`
+  (lap count and best lap match what the Data group shows once that session is
+  loaded) — click **Load** to load both into the app with the offset already
+  dialed in, and the preview/scrubber automatically clamped to just the range
+  the video actually covers.
+- Results are cached per folder pair — reopening the wizard with the same AiM/
+  video folders restores the table instantly instead of re-parsing gyro
+  telemetry for every pairing again. Click **Find Matches** again if you've
+  added/changed files in either folder.
+
+This can take a while on a large folder — gyro correlation means parsing the
+full telemetry stream for every video and every session it's still a
+candidate for. If you already know the session and video you want to load I recommend 
+moving them to their own folder and just using the wizard to sync footage to data.
 
 ## Loading video
 
 Click **Open Video…** in the **Video** group to load your race footage. Once
-loaded, the canvas preview shows the actual video frame behind your widgets
-instead of a green fill, and audio plays back in sync with the scrubber and
-▶/⏸ controls (volume slider next to the scrubber).
+loaded, the canvas preview shows the video behind your widgets.
 
-- **Offset** — shifts the video relative to the preview timeline (zero-based
-  at the start of whatever lap range is selected — see below). Increasing it
-  pulls an *earlier* video frame forward to match the current playback
-  position; use it to line up GPS-derived widgets against the footage, and
-  the per-widget **Time Offset** (below) for channels that drift relative to
-  that sync.
-- **Make Low-Lag Preview…** — many camera/editor exports use a very long
-  GOP (sometimes a single keyframe for the whole clip), which makes seeking
-  in-app painfully slow regardless of resolution or bitrate. This transcodes
-  a small proxy (lower resolution, frequent keyframes) via ffmpeg and swaps
-  it in for preview only — exports always use the original, full-quality
-  source. Requires ffmpeg.
+- **Offset** — the video's own start, expressed as an absolute position within
+  the session (e.g. `227.2` means the video begins 227.2s into the log).
+  This stays constant no matter which lap you select afterward — switching
+  laps doesn't require re-tuning it. Use it to line up GPS-derived widgets
+  against the footage, and the per-widget **Time Offset** (below) for channels
+  that drift relative to that sync. Before the video's own start (e.g.
+  scrubbing earlier than the offset allows), the preview shows the green
+  screen instead of freezing on the first frame.
+- **Make Low-Lag Preview…** — This transcodes a small proxy via ffmpeg and swaps it in for preview only, may help preview playback framerate.
 - Loading a video also sets **Export FPS** (in the sidebar, near the bottom)
-  to the source's exact frame rate, including fractional rates like `59.94` —
-  don't round these to `60` if you plan to reimport into an NTSC-rate
-  timeline, or the overlay will slowly drift out of sync with your footage.
+  to the source's exact frame rate.
 
 ## The canvas and widgets
 
 Add a widget with the buttons under **Add Widget**, then drag it into position
 on the canvas. Click a widget to select it (its properties appear on the
-right); drag its bottom-right corner to resize.
+right); drag its bottom-right corner to resize. Only Bar Graph shows a color
+outline by default (it doubles as the fill color) — the rest just show a dark
+background, plus a dashed selection border while you're editing them.
 
 ### Widget types
 
@@ -90,16 +125,18 @@ right); drag its bottom-right corner to resize.
   `Last` (previous completed lap's time), `Best` (fastest completed lap so
   far), and `Lap` (current lap number, starting at `0` for the out-lap before
   the first beacon crossing). Toggle each line on/off and pick a text color in
-  the properties panel. Requires `Beacon Markers` in the log — no channel
-  selection needed.
-- **Numeric Display** — `label: value` for any selected channel.
+  the properties panel.
+- **Numeric Display** — the value on top, label centered beneath it, for any
+  selected channel. **Decimals** controls how many decimal places the value
+  shows; **Label Font Size** sizes the label independently of the value
+  (which scales with the widget's own **Scale**).
 - **Bar Graph** — a fill bar for any selected channel, scaled to that channel's
   observed min/max automatically when you pick it (override Min/Max
   afterward if you want a fixed scale). Optionally hide the numeric value and
-  just show the bar. Fill color and text color are both editable.
+  just show the bar. Fill color and text color are both editable. **Decimals**
+  controls the displayed value's precision here too.
 - **Track Map** — draws the GPS path from lap 1 as a reference line, with a dot
   for the current position (held at the start/finish line during the out-lap).
-  Requires `GPS Latitude`/`GPS Longitude` channels — no channel selection needed.
 
 All widgets share:
 - **Label** — editable text.
@@ -111,6 +148,8 @@ All widgets share:
   Useful for channels (e.g. CAN bus data) that lag behind GPS-derived ones —
   dial in a per-widget correction without touching the shared timeline or
   video sync. Positive values sample further ahead in the log.
+	-Channels taken from the car ECU such as RPM tend to lag. I manually dial in an offset for these channels by scrubbing to a point in the video where
+	 I shift at redline and then adjust the RPM offset until it matches well.
 
 ## Selecting laps
 
@@ -121,8 +160,7 @@ range), optionally generate a sync `.txt` file (frame/timestamp at each lap
 start), and confirm.
 
 **Pad Start** / **Pad End** (also in the **Data** group) add seconds before/
-after the selected range independently, and re-apply live as you change them
-— no need to reopen the dialog. If padding would extend past the end of the
+after the selected range independently. If padding would extend past the end of the
 loaded video (given the current offset), it's clamped to what footage
 actually exists and you'll get a warning showing how much was trimmed,
 instead of the export silently truncating itself.
@@ -140,28 +178,33 @@ instead of the export silently truncating itself.
 
 **File → Save Layout…** (`Ctrl+S`) or the **Save Layout…** button in the
 sidebar writes every widget's type, position, scale, channel, colors, time
-offset, and other settings to a JSON file. **Load Layout…** reads one back —
-handy for reusing the same overlay arrangement across multiple sessions/logs.
-You can also auto-load a layout at launch with `--layout`, or by placing a
-`default_layout.json` in `source/` (see [Launch arguments](#launch-arguments)).
+offset, and other settings — plus the **Overlay Resolution** — to a JSON file.
+**Load Layout…** reads one back, restoring the resolution too, and handles
+older layout files that don't have it saved (falls back to whatever's
+currently set). Handy for reusing the same overlay arrangement across
+multiple sessions/logs, especially if different cameras need different
+resolutions/aspect ratios. You can also auto-load a layout at launch with
+`--layout`, or by placing a `default_layout.json` in `source/` (see
+[Launch arguments](#launch-arguments)).
 
 ## Exporting
 
-Click **🎬 Export Video…** (or **Export → Export Video…**, `Ctrl+E`).
+Click **🎬 Export Video…** in the **Video** group (or **Export → Export Video…**, `Ctrl+E`).
 
 - If a video is loaded, the export composites your widgets directly onto the
-  original (full-quality) source footage, with matching audio muxed in via
-  ffmpeg afterward (cv2's writer can't write audio itself). If ffmpeg isn't
-  available, the export still succeeds — silently, with a note in the "Done"
-  dialog explaining why.
-- If no video is loaded, it falls back to the original green-screen behavior
+  original source footage. If ffmpeg isn't available, the export still 
+  succeeds — silently, with a note in the "Done" dialog explaining why.
+- If no video is loaded, a green screen background is exported.
   (see [Compositing in your editor](#compositing-in-your-editor)).
 - If the log has lap markers, you must [select laps](#selecting-laps) first —
   export uses whatever's currently selected in the sidebar rather than
   prompting again.
-
-Pick an output path and the render runs in the background with a progress
-dialog; **Cancel** actually stops the render and deletes the partial file.
+- The export destination can't be the same file as the currently loaded
+  source video (it reads frames from that file while writing the output,
+  which would corrupt it) — pick a different filename. If muxing the audio in
+  hits a transient file lock (antivirus scan, Explorer thumbnailing, etc.),
+  it retries automatically for a few seconds before giving up and noting it
+  in the "Done" dialog.
 
 Export resolution is the **Overlay Resolution** field in the sidebar when
 compositing onto video (so widget positions map 1:1 onto the source frame),
@@ -171,7 +214,4 @@ or the bounding box of all your widgets when falling back to green screen.
 
 If you exported without a loaded video, the output is rendered on a solid
 green background (BGR `(0, 180, 0)`). Import it as a layer above your footage
-and apply a chroma key / green screen effect (e.g. DaVinci Resolve's Ultra
-Key) to key it out, leaving just the overlay graphics. If you exported with a
-video loaded, the footage and audio are already composited in — no further
-keying needed.
+and apply a chroma key / green screen effect to key it out, leaving just the overlay graphics.

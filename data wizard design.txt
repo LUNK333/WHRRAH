@@ -1,0 +1,17 @@
+alright let's make like a data wizard for the app that can you can point at the folders for where the aim data lives and where the video files live and have it pair the 2 together:
+
+button in main window launches wizard
+
+button to select aim folder
+button select video folder
+
+store the path locations somewhere for next time the app is launched
+
+match data to video
+
+display table of video:data matchups with %confidence in match
+
+Load buttons loads selected video and data match to app ex:
+
+AIM_1221 : video_0278 confidence (99%) [load]
+AIM_1337 : video _0420 confidence (69%) [load]
