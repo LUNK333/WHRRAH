@@ -2970,7 +2970,16 @@ class MainWindow(QMainWindow):
         self._play_timer.setInterval(33)  # ~30 ticks/sec
         self._play_timer.timeout.connect(self._on_play_tick)
 
-        root.addWidget(left)
+        # The sidebar's natural height can exceed a small/scaled laptop screen —
+        # scroll it instead of letting the layout squish everything below a
+        # readable size when the window is maximized to fit the display.
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        left_scroll.setFixedWidth(220)
+
+        root.addWidget(left_scroll)
         root.addWidget(canvas_col, 1)
         root.addWidget(self.props)
 
@@ -3523,6 +3532,11 @@ if __name__ == "__main__":
     parser.add_argument("csv", nargs="?", help="AiM RS2 CSV log to auto-load on launch")
     parser.add_argument("--layout", help="Overlay layout JSON file to auto-load on launch")
     args, qt_args = parser.parse_known_args(sys.argv[1:])
+
+    # Laptops with small, fractionally-scaled displays (125%/150%/175%) make Qt6's
+    # default DPI rounding produce mismatched/overlapping widget repaints. PassThrough
+    # uses the exact scale factor instead of rounding it to the nearest integer.
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication([sys.argv[0]] + qt_args)
     app.setStyle("Fusion")
