@@ -1,0 +1,188 @@
+{
+  "resolution": [
+    2688,
+    2016
+  ],
+  "widgets": [
+    {
+      "widget_type": "Lap Timer",
+      "x": 1864,
+      "y": 252,
+      "scale_x": 3.909090909090909,
+      "scale_y": 3.909090909090909,
+      "channel": "",
+      "label": "Lap Timer",
+      "min_val": 0.0,
+      "max_val": 100.0,
+      "color": [
+        0,
+        255,
+        0
+      ],
+      "show_value": true,
+      "text_color": [
+        0,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": 0.0,
+      "decimals": 2,
+      "label_font_size": 16
+    },
+    {
+      "widget_type": "Numeric Display",
+      "x": 1253,
+      "y": 1622,
+      "scale_x": 4.33,
+      "scale_y": 4.33,
+      "channel": "GPS Speed",
+      "label": "MPH",
+      "min_val": 0.0,
+      "max_val": 100.0,
+      "color": [
+        0,
+        255,
+        0
+      ],
+      "show_value": true,
+      "text_color": [
+        0,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": 0.0,
+      "decimals": 0,
+      "label_font_size": 53
+    },
+    {
+      "widget_type": "Track Map",
+      "x": 2403,
+      "y": 252,
+      "scale_x": 1.2954545454545454,
+      "scale_y": 1.2954545454545454,
+      "channel": "",
+      "label": "",
+      "min_val": 0.0,
+      "max_val": 100.0,
+      "color": [
+        0,
+        255,
+        0
+      ],
+      "show_value": true,
+      "text_color": [
+        255,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": 0.0,
+      "decimals": 2,
+      "label_font_size": 16
+    },
+    {
+      "widget_type": "Bar Graph",
+      "x": 1488,
+      "y": 1674,
+      "scale_x": 6.0,
+      "scale_y": 1.5,
+      "channel": "RPM",
+      "label": "RPM",
+      "min_val": 0.0,
+      "max_val": 8094.824617346938,
+      "color": [
+        0,
+        0,
+        255
+      ],
+      "show_value": true,
+      "text_color": [
+        255,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": -0.35,
+      "decimals": 0,
+      "label_font_size": 16
+    },
+    {
+      "widget_type": "Bar Graph",
+      "x": 1488,
+      "y": 1486,
+      "scale_x": 6.0,
+      "scale_y": 1.5,
+      "channel": "PEDAL POSITION",
+      "label": "Throttle",
+      "min_val": 0.0,
+      "max_val": 99.21240234375,
+      "color": [
+        127,
+        0,
+        0
+      ],
+      "show_value": false,
+      "text_color": [
+        255,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": -0.35,
+      "decimals": 2,
+      "label_font_size": 16
+    },
+    {
+      "widget_type": "Bar Graph",
+      "x": 1488,
+      "y": 1583,
+      "scale_x": 6.0,
+      "scale_y": 1.5,
+      "channel": "BRAKE SWITCH",
+      "label": "Brake",
+      "min_val": 0.0,
+      "max_val": 1.0,
+      "color": [
+        0,
+        255,
+        0
+      ],
+      "show_value": false,
+      "text_color": [
+        255,
+        255,
+        255
+      ],
+      "show_time": true,
+      "show_last": true,
+      "show_best": true,
+      "show_lap": true,
+      "selected": false,
+      "time_offset": -0.7,
+      "decimals": 2,
+      "label_font_size": 16
+    }
+  ]
+}

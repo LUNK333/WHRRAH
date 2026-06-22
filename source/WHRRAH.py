@@ -1321,10 +1321,19 @@ class OverlayCanvas(QWidget):
 
     selection_changed = pyqtSignal(object)  # emits selected OverlayWidget or None
 
+    # width:height ratios for each non-"Original" aspect ratio option.
+    ASPECT_RATIOS = {
+        "Original": None,
+        "4:3": 4 / 3,
+        "16:9": 16 / 9,
+        "21:9": 21 / 9,
+    }
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.overlay_width = 1920
         self.overlay_height = 1080
+        self.aspect_ratio = "Original"
         self.widgets: list[OverlayWidget] = []
         self.selected: OverlayWidget | None = None
         self._drag_offset = QPoint()
@@ -1345,6 +1354,30 @@ class OverlayCanvas(QWidget):
         self.overlay_width = w
         self.overlay_height = h
         self.update()
+
+    def set_aspect_ratio(self, ratio_name: str):
+        self.aspect_ratio = ratio_name if ratio_name in self.ASPECT_RATIOS else "Original"
+        self.update()
+
+    def crop_rect(self) -> tuple[int, int, int, int]:
+        """(x, y, w, h) in overlay pixels — the region widgets are confined to
+        and, on export, the region the output video is cropped to. Prefers
+        expanding to the full canvas width and cropping vertically; only
+        crops horizontally instead if the ratio is too tall to fit that way."""
+        ratio = self.ASPECT_RATIOS.get(self.aspect_ratio)
+        ow, oh = self.overlay_width, self.overlay_height
+        if ratio is None:
+            return 0, 0, ow, oh
+
+        crop_w, crop_h = ow, round(ow / ratio)
+        if crop_h > oh:
+            crop_h = oh
+            crop_w = round(crop_h * ratio)
+        crop_w = max(1, min(ow, crop_w))
+        crop_h = max(1, min(oh, crop_h))
+        x = (ow - crop_w) // 2
+        y = (oh - crop_h) // 2
+        return x, y, crop_w, crop_h
 
     def set_data_log(self, dl: DataLog):
         self._data_log = dl
@@ -1488,6 +1521,19 @@ class OverlayCanvas(QWidget):
             painter.drawImage(self._fit_rect(frame_rect, qimg.width(), qimg.height()), qimg)
         else:
             painter.fillRect(frame_rect, QColor(0, 180, 0))
+
+        # Dim the area outside the aspect-ratio crop box (editor guide only —
+        # never rendered into the export).
+        if self.aspect_ratio != "Original":
+            cx, cy, cw, ch = self.crop_rect()
+            crop_tl = self._to_canvas(cx, cy)
+            crop_br = self._to_canvas(cx + cw, cy + ch)
+            crop_screen_rect = QRect(crop_tl, crop_br)
+            dim = QColor(0, 0, 0, 140)
+            painter.fillRect(QRect(frame_rect.topLeft(), QPoint(frame_rect.right(), crop_screen_rect.top())), dim)
+            painter.fillRect(QRect(QPoint(frame_rect.left(), crop_screen_rect.bottom()), frame_rect.bottomRight()), dim)
+            painter.fillRect(QRect(frame_rect.topLeft(), QPoint(crop_screen_rect.left(), frame_rect.bottom())), dim)
+            painter.fillRect(QRect(QPoint(crop_screen_rect.right(), frame_rect.top()), frame_rect.bottomRight()), dim)
 
         # Draw each widget as a placeholder rectangle
         for w in self.widgets:
@@ -1660,6 +1706,18 @@ class OverlayCanvas(QWidget):
                 handle = QRect(br.x() - 8, br.y() - 8, 8, 8)
                 painter.fillRect(handle, QColor(255, 255, 0))
 
+        # Aspect-ratio crop box outline — editor guide only, drawn last so
+        # it's visible over the widgets. Never rendered into the export.
+        if self.aspect_ratio != "Original":
+            cx, cy, cw, ch = self.crop_rect()
+            crop_tl = self._to_canvas(cx, cy)
+            crop_br = self._to_canvas(cx + cw, cy + ch)
+            pen = QPen(QColor(255, 255, 0))
+            pen.setWidth(2)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(QRect(crop_tl, crop_br))
+
         painter.end()
 
     def mousePressEvent(self, event):
@@ -1704,15 +1762,17 @@ class OverlayCanvas(QWidget):
         return False
 
     def _find_free_spot(self, widget: "OverlayWidget") -> tuple[int, int]:
-        """Find a position for a newly added widget that doesn't overlap existing ones."""
+        """Find a position (within the aspect-ratio crop box) for a newly
+        added widget that doesn't overlap existing ones."""
+        cx, cy, cw, ch = self.crop_rect()
         step = 20
-        x, y = 50, 50
+        x, y = cx + 50, cy + 50
         while self._overlaps_others(widget, x, y, widget.w, widget.h):
             y += step
-            if y + widget.h > self.overlay_height:
-                y = 50
+            if y + widget.h > cy + ch:
+                y = cy + 50
                 x += step * 3
-            if x + widget.w > self.overlay_width:
+            if x + widget.w > cx + cw:
                 break  # no free space left — place it anyway rather than loop forever
         return x, y
 
@@ -1734,13 +1794,18 @@ class OverlayCanvas(QWidget):
                     s = max(0.2, new_w / base_w)
                     self.selected.scale_x = s
                     self.selected.scale_y = s
-                # Reject resizes that would make the widget overlap a neighbor.
-                if self._overlaps_others(self.selected, self.selected.x, self.selected.y,
-                                          self.selected.w, self.selected.h):
+                # Reject resizes that would make the widget overlap a neighbor
+                # or grow past the aspect-ratio crop box.
+                cx, cy, cw, ch = self.crop_rect()
+                exceeds_crop = (self.selected.x + self.selected.w > cx + cw
+                                or self.selected.y + self.selected.h > cy + ch)
+                if exceeds_crop or self._overlaps_others(self.selected, self.selected.x, self.selected.y,
+                                                           self.selected.w, self.selected.h):
                     self.selected.scale_x, self.selected.scale_y = prev_sx, prev_sy
             else:
-                new_x = max(0, min(self.overlay_width - self.selected.w, ox - self._drag_offset.x()))
-                new_y = max(0, min(self.overlay_height - self.selected.h, oy - self._drag_offset.y()))
+                cx, cy, cw, ch = self.crop_rect()
+                new_x = max(cx, min(cx + cw - self.selected.w, ox - self._drag_offset.x()))
+                new_y = max(cy, min(cy + ch - self.selected.h, oy - self._drag_offset.y()))
                 w_, h_ = self.selected.w, self.selected.h
                 # Try the full move; if it would overlap, slide along whichever
                 # single axis still works, so dragging diagonally past another
@@ -2180,7 +2245,8 @@ class ExportThread(QThread):
                  lap_windows: list[tuple[float, float, list[tuple[int, float]]]] | None = None,
                  write_sync_file: bool = False,
                  video_path: str | None = None, video_offset: float = 0.0,
-                 output_size: tuple[int, int] | None = None):
+                 output_size: tuple[int, int] | None = None,
+                 crop_rect: tuple[int, int, int, int] | None = None):
         super().__init__()
         self.widgets = widgets
         self.data_log = data_log
@@ -2201,6 +2267,11 @@ class ExportThread(QThread):
         self.video_path = video_path
         self.video_offset = video_offset
         self.output_size = output_size
+        # (x, y, w, h) in overlay-canvas pixels — if set (a non-"Original"
+        # aspect ratio was chosen), the full canvas is still composited so
+        # widget coordinates stay meaningful, then each frame is cropped to
+        # this region before writing. Never drawn into the frame itself.
+        self.crop_rect = crop_rect
         self._cancel_requested = False
 
     def cancel(self):
@@ -2354,14 +2425,26 @@ class ExportThread(QThread):
                 w_max, h_max = self.output_size or (1920, 1080)
                 video_last_msec = -1.0
                 video_last_frame = None
+            elif self.crop_rect is not None:
+                # A crop region is defined relative to the full overlay
+                # canvas, so that canvas has to actually be composited at
+                # full size before cropping — can't use the tight
+                # widget-bounds sizing from the no-crop green-screen path.
+                w_max, h_max = self.output_size or (1920, 1080)
             else:
-                # No video loaded — fall back to the original green-screen
-                # behavior, sized to the widget bounds for chroma-keying.
+                # No video loaded and no crop — fall back to the original
+                # green-screen behavior, sized to the widget bounds for
+                # chroma-keying.
                 w_max = max((ww.x + ww.w for ww in self.widgets), default=1920)
                 h_max = max((ww.y + ww.h for ww in self.widgets), default=1080)
 
+            if self.crop_rect is not None:
+                crop_x, crop_y, crop_w, crop_h = self.crop_rect
+            else:
+                crop_x, crop_y, crop_w, crop_h = 0, 0, w_max, h_max
+
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (w_max, h_max))
+            writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (crop_w, crop_h))
 
             # Also used when video_cap is set but a positive offset means
             # the video hasn't actually started yet at this point in the render.
@@ -2407,7 +2490,8 @@ class ExportThread(QThread):
 
                     for ww in self.widgets:
                         ww.render_to_frame(frame, dl, t)
-                    writer.write(frame)
+                    out_frame = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w] if self.crop_rect is not None else frame
+                    writer.write(out_frame)
                     done += 1
                     self.progress.emit(int(done / total_frames * 100))
 
@@ -2804,6 +2888,10 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self.export_video)
         export_menu.addAction(act_export)
 
+        act_sample = QAction("Render 5s Sample at Playhead", self)
+        act_sample.triggered.connect(self.export_sample_clip)
+        export_menu.addAction(act_sample)
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -2884,6 +2972,20 @@ class MainWindow(QMainWindow):
         lyl.addWidget(self.btn_save_layout)
         lyl.addWidget(self.btn_load_layout)
 
+        res_form = QFormLayout()
+        self.spn_res_w = QSpinBox(); self.spn_res_w.setRange(640, 7680); self.spn_res_w.setValue(1920)
+        self.spn_res_h = QSpinBox(); self.spn_res_h.setRange(360, 4320); self.spn_res_h.setValue(1080)
+        self.spn_res_w.valueChanged.connect(self._on_res_change)
+        self.spn_res_h.valueChanged.connect(self._on_res_change)
+        res_form.addRow("W:", self.spn_res_w)
+        res_form.addRow("H:", self.spn_res_h)
+
+        self.cmb_aspect_ratio = QComboBox()
+        self.cmb_aspect_ratio.addItems(list(OverlayCanvas.ASPECT_RATIOS.keys()))
+        self.cmb_aspect_ratio.currentTextChanged.connect(self._on_aspect_ratio_change)
+        res_form.addRow("Aspect Ratio:", self.cmb_aspect_ratio)
+        lyl.addLayout(res_form)
+
         grp_widgets = QGroupBox("Add Widget")
         wl = QVBoxLayout(grp_widgets)
         for wtype in WIDGET_TYPES:
@@ -2894,15 +2996,6 @@ class MainWindow(QMainWindow):
         self.btn_delete = QPushButton("Delete Selected")
         self.btn_delete.clicked.connect(self.canvas_delete)
         self.btn_delete.setEnabled(False)
-
-        grp_res = QGroupBox("Overlay Resolution")
-        rl = QFormLayout(grp_res)
-        self.spn_res_w = QSpinBox(); self.spn_res_w.setRange(640, 7680); self.spn_res_w.setValue(1920)
-        self.spn_res_h = QSpinBox(); self.spn_res_h.setRange(360, 4320); self.spn_res_h.setValue(1080)
-        self.spn_res_w.valueChanged.connect(self._on_res_change)
-        self.spn_res_h.valueChanged.connect(self._on_res_change)
-        rl.addRow("W:", self.spn_res_w)
-        rl.addRow("H:", self.spn_res_h)
 
         grp_fps = QGroupBox("Export FPS")
         fl = QFormLayout(grp_fps)
@@ -2917,7 +3010,6 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(grp_layout)
         left_layout.addWidget(grp_widgets)
         left_layout.addWidget(self.btn_delete)
-        left_layout.addWidget(grp_res)
         left_layout.addWidget(grp_fps)
         left_layout.addStretch()
 
@@ -2985,6 +3077,9 @@ class MainWindow(QMainWindow):
 
     def _on_res_change(self):
         self.canvas.set_resolution(self.spn_res_w.value(), self.spn_res_h.value())
+
+    def _on_aspect_ratio_change(self, ratio_name: str):
+        self.canvas.set_aspect_ratio(ratio_name)
 
     def _on_selection(self, w):
         self.props.load_widget(w)
@@ -3422,6 +3517,7 @@ class MainWindow(QMainWindow):
     def save_layout_file(self, path: str):
         data = {
             "resolution": [self.canvas.overlay_width, self.canvas.overlay_height],
+            "aspect_ratio": self.canvas.aspect_ratio,
             "widgets": [w.to_dict() for w in self.canvas.widgets],
         }
         with open(path, "w") as f:
@@ -3442,10 +3538,11 @@ class MainWindow(QMainWindow):
             # resolution recorded — fall back to whatever's currently set
             # rather than erroring on them.
             if isinstance(data, list):
-                widget_dicts, resolution = data, None
+                widget_dicts, resolution, aspect_ratio = data, None, None
             else:
                 widget_dicts = data.get("widgets", [])
                 resolution = data.get("resolution")
+                aspect_ratio = data.get("aspect_ratio")
 
             self.canvas.widgets = [OverlayWidget.from_dict(d) for d in widget_dicts]
             self.canvas.selected = None
@@ -3454,6 +3551,9 @@ class MainWindow(QMainWindow):
                 self.spn_res_w.setValue(res_w)
                 self.spn_res_h.setValue(res_h)
                 self.canvas.set_resolution(res_w, res_h)
+            idx = self.cmb_aspect_ratio.findText(aspect_ratio or "Original")
+            self.cmb_aspect_ratio.setCurrentIndex(idx if idx >= 0 else 0)
+            self.canvas.set_aspect_ratio(aspect_ratio or "Original")
             self.canvas.update()
             self.props.load_widget(None)
             self.btn_delete.setEnabled(False)
@@ -3494,12 +3594,14 @@ class MainWindow(QMainWindow):
         progress.setWindowModality(Qt.WindowModality.WindowModal)
         progress.show()
 
+        crop_rect = self.canvas.crop_rect() if self.canvas.aspect_ratio != "Original" else None
         self._export_thread = ExportThread(
             self.canvas.widgets, self.data_log, self.spn_fps.value(), path,
             self._lap_windows_for_export, self._write_sync_file,
             video_path=self._source_video_path,
             video_offset=self.spn_video_offset.value(),
             output_size=(self.spn_res_w.value(), self.spn_res_h.value()),
+            crop_rect=crop_rect,
         )
         progress.canceled.connect(self._export_thread.cancel)
         self._export_thread.progress.connect(progress.setValue)
@@ -3521,6 +3623,60 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Export canceled.")
         ))
         self._export_thread.start()
+
+    def export_sample_clip(self):
+        """Quick 5s test render starting at the current playhead — for
+        checking how a widget/layout/font choice actually looks without
+        waiting on a full export."""
+        if not self.data_log.timestamps:
+            QMessageBox.warning(self, "No Data", "Load a data log before exporting.")
+            return
+        if not self.canvas.widgets:
+            QMessageBox.warning(self, "No Widgets", "Add at least one widget before exporting.")
+            return
+
+        t0 = self.data_log.timestamps[0]
+        t_end = self.data_log.timestamps[-1]
+        start_t = max(t0, min(self.canvas._preview_time, t_end))
+        end_t = min(t_end, start_t + 5.0)
+        if end_t - start_t < 0.1:
+            start_t = max(t0, t_end - 5.0)
+            end_t = t_end
+
+        out_dir = os.path.dirname(self.data_log.filepath) if self.data_log.filepath else os.getcwd()
+        i = 1
+        while os.path.exists(os.path.join(out_dir, f"sample_clip_{i}.mp4")):
+            i += 1
+        path = os.path.join(out_dir, f"sample_clip_{i}.mp4")
+
+        progress = QProgressDialog("Rendering 5s sample…", "Cancel", 0, 100, self)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.show()
+
+        crop_rect = self.canvas.crop_rect() if self.canvas.aspect_ratio != "Original" else None
+        self._sample_export_thread = ExportThread(
+            self.canvas.widgets, self.data_log, self.spn_fps.value(), path,
+            lap_windows=[(start_t, end_t, [])],
+            video_path=self._source_video_path,
+            video_offset=self.spn_video_offset.value(),
+            output_size=(self.spn_res_w.value(), self.spn_res_h.value()),
+            crop_rect=crop_rect,
+        )
+        progress.canceled.connect(self._sample_export_thread.cancel)
+        self._sample_export_thread.progress.connect(progress.setValue)
+        self._sample_export_thread.finished.connect(lambda video_path, sync_path, audio_note: (
+            progress.close(),
+            QMessageBox.information(self, "Done", f"Sample clip exported to:\n{video_path}")
+        ))
+        self._sample_export_thread.error.connect(lambda e: (
+            progress.close(),
+            QMessageBox.critical(self, "Export Error", e)
+        ))
+        self._sample_export_thread.canceled.connect(lambda: (
+            progress.close(),
+            self.statusBar().showMessage("Sample export canceled.")
+        ))
+        self._sample_export_thread.start()
 
 
 # ---------------------------------------------------------------------------
