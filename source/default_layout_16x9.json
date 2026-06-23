@@ -3,6 +3,7 @@
     2688,
     2016
   ],
+  "aspect_ratio": "16:9",
   "widgets": [
     {
       "widget_type": "Lap Timer",

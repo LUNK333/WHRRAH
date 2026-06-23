@@ -16,13 +16,12 @@ python source/WHRRAH.py
 
 Requires Python 3.10+ (uses modern type-hint syntax).
 
-**ffmpeg is optional but recommended** — it's used for three things: generating
-a low-lag preview proxy for laggy source footage, muxing audio into a
-composited export, and the Data Wizard's gyro-based sync matching for DJI
+**ffmpeg is optional but recommended** — it's used for muxing audio into a
+composited export and the Data Wizard's gyro-based sync matching for DJI
 footage. The app looks for `ffmpeg` on PATH (falls back to a couple of common
 Windows install locations). Without it, everything else still works;
-composited exports just come out silent, you won't have the low-lag preview
-option, and wizard matching falls back to coarse EXIF-timestamp matching.
+composited exports just come out silent, and wizard matching falls back to
+coarse EXIF-timestamp matching.
 
 **`.xrk` support requires `source/xrk_dll/`** (bundled in this repo) — a small
 wrapper around AiM's official `MatLabXRK` DLL. This is Windows-only; CSV logs work everywhere.
@@ -107,7 +106,6 @@ loaded, the canvas preview shows the video behind your widgets.
   that drift relative to that sync. Before the video's own start (e.g.
   scrubbing earlier than the offset allows), the preview shows the green
   screen instead of freezing on the first frame.
-- **Make Low-Lag Preview…** — This transcodes a small proxy via ffmpeg and swaps it in for preview only, may help preview playback framerate.
 - Loading a video also sets **Export FPS** (in the sidebar, near the bottom)
   to the source's exact frame rate.
 
