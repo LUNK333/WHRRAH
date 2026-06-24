@@ -12,8 +12,8 @@ import ctypes
 import functools
 import json
 import math
+import re
 import shutil
-import struct
 import subprocess
 import tempfile
 import time
@@ -21,6 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+import telemetry_parser
 from PIL import Image, ImageDraw, ImageFont
 
 from PyQt6.QtWidgets import (
@@ -184,7 +185,8 @@ def _resample_to_grid(native_t: list[float], native_v: list[float], grid: list[f
 # ---------------------------------------------------------------------------
 # Video/log matching (the "Data Wizard") — pairs up AiM .xrk sessions with
 # video files by cross-correlating each video's embedded gyro orientation
-# (DJI djmd stream) against the session's YawRate/RollRate/PitchRate.
+# (via telemetry_parser — DJI, GoPro, Insta360, etc.) against the session's
+# YawRate/RollRate/PitchRate.
 # Confirmed empirically: a real match gives a sharp correlation peak
 # (~0.9-0.98); EXIF creation_time is only used as a coarse pre-filter since
 # camera clocks can be wrong by exactly an hour (DST misconfig) or more.
@@ -338,143 +340,82 @@ def xrk_rotation_signal(path: str, grid_rate: float = 20.0) -> tuple[list[float]
         xrk.close(idxf)
 
 
+# Matches telemetry_parser's Rust Debug-format text for a TimeQuaternion
+# entry, e.g. "TimeQuaternion { t: 1.23, v: Quaternion { w: ..., x: ...,
+# y: ..., z: ... } }". This is an internal representation, not a stable
+# public API — _quaternion_samples_from_blocks() falls back to the slower,
+# structured dict parse below if this stops matching anything.
+_QUATERNION_RE = re.compile(
+    r"t: ([-\d.eE]+), v: Quaternion \{ w: ([-\d.eE]+), x: ([-\d.eE]+), y: ([-\d.eE]+), z: ([-\d.eE]+)"
+)
+
+
+def _quaternion_samples_from_blocks(blocks) -> list[tuple[float, float, float, float, float]]:
+    """One (t, w, x, y, z) sample per block — each block corresponds almost
+    exactly to one video frame, confirmed empirically (block count matches
+    frame count), so the last sample in each block's burst gives the same
+    per-frame resolution the old per-frame extractor used."""
+    samples = []
+    for block in blocks:
+        quat = block.get("Quaternion")
+        if not quat:
+            continue
+        data = quat["Data"]
+        if isinstance(data, str):
+            # human_readable=True text form — only search from the last
+            # entry onward, since we just want one sample per block and a
+            # full per-block regex scan over every sub-sample is the actual
+            # bottleneck otherwise (confirmed empirically: ~4x slower).
+            idx = data.rfind("TimeQuaternion")
+            m = _QUATERNION_RE.search(data, idx if idx >= 0 else 0)
+            if m:
+                t, w, x, y, z = (float(g) for g in m.groups())
+                samples.append((t / 1000.0, w, x, y, z))
+        elif data:
+            s = data[-1]
+            v = s["v"]
+            samples.append((s["t"] / 1000.0, v["w"], v["x"], v["y"], v["z"]))
+    return samples
+
+
 def video_gyro_signal(path: str) -> tuple[list[float], list[float]] | None:
-    """(timestamps, |angular velocity|) derived from the DJI djmd stream's
-    per-frame orientation quaternions. Returns None if ffmpeg isn't
-    available, the video has no djmd stream, or it's not a DJI file with
-    this metadata schema."""
-    ffmpeg_path = find_ffmpeg()
-    if not ffmpeg_path:
-        return None
-
-    cap = cv2.VideoCapture(path)
+    """(timestamps, |angular velocity|) derived from the video's embedded
+    orientation quaternions, via telemetry_parser (supports DJI, GoPro,
+    Insta360, and more). Returns None if the file has no parseable
+    telemetry track."""
     try:
-        if not cap.isOpened():
-            return None
-        fps = cap.get(cv2.CAP_PROP_FPS)
-    finally:
-        cap.release()
-    if not fps or fps <= 0:
+        parser = telemetry_parser.Parser(path)
+        # human_readable=True skips telemetry_parser's expensive per-sample
+        # Python object marshalling in favor of a single debug-format string
+        # per block — confirmed empirically: ~5x faster to extract from.
+        blocks = parser.telemetry(human_readable=True)
+        samples = _quaternion_samples_from_blocks(blocks)
+        if not samples:
+            # Format mismatch (or this file's blocks don't carry Quaternion
+            # data at all) — retry with the structured (slower) parse before
+            # giving up.
+            samples = _quaternion_samples_from_blocks(parser.telemetry())
+    except Exception:
+        return None
+    if len(samples) < 2:
         return None
 
-    with tempfile.TemporaryDirectory(prefix="whrrah_djmd_") as tmp_dir:
-        djmd_path = os.path.join(tmp_dir, "djmd.bin")
-        result = subprocess.run(
-            [ffmpeg_path, "-y", "-i", path, "-map", "0:2", "-c", "copy", "-f", "data", djmd_path],
-            capture_output=True
-        )
-        if result.returncode != 0 or not os.path.isfile(djmd_path):
-            return None
-        with open(djmd_path, "rb") as f:
-            data = f.read()
-
-    frame_quats = _parse_djmd_frame_quaternions(data)
-    if len(frame_quats) < 2:
-        return None
-
-    dt = 1.0 / fps
+    timestamps = []
     ang_vel = []
-    for k in range(1, len(frame_quats)):
-        w1, x1, y1, z1 = frame_quats[k - 1]
-        w2, x2, y2, z2 = frame_quats[k]
+    for k in range(1, len(samples)):
+        t1, w1, x1, y1, z1 = samples[k - 1]
+        t2, w2, x2, y2, z2 = samples[k]
+        dt = t2 - t1
+        if dt <= 0:
+            continue
         rw = w2 * w1 - x2 * (-x1) - y2 * (-y1) - z2 * (-z1)
         rw = max(-1.0, min(1.0, rw))
         angle_deg = math.degrees(2 * math.acos(abs(rw)))
+        timestamps.append(t2)
         ang_vel.append(angle_deg / dt)
-    timestamps = [(k + 1) / fps for k in range(len(ang_vel))]
+    if len(timestamps) < 2:
+        return None
     return timestamps, ang_vel
-
-
-def _read_varint(buf: bytes, i: int) -> tuple[int, int]:
-    result = 0
-    shift = 0
-    while True:
-        b = buf[i]
-        i += 1
-        result |= (b & 0x7f) << shift
-        if not (b & 0x80):
-            break
-        shift += 7
-    return result, i
-
-
-def _decode_protobuf_fields(buf: bytes, max_items: int = 10**9) -> tuple[list[tuple[int, str, object]], int]:
-    """Generic, schema-less protobuf wire-format walker — just enough to
-    locate the DJI djmd quaternion bursts without needing their .proto
-    definition (which isn't published for this camera's schema version)."""
-    i, n, count, out = 0, len(buf), 0, []
-    while i < n and count < max_items:
-        try:
-            tag, i = _read_varint(buf, i)
-        except IndexError:
-            break
-        field_num, wire_type = tag >> 3, tag & 0x7
-        if wire_type == 0:
-            val, i = _read_varint(buf, i)
-            out.append((field_num, "varint", val))
-        elif wire_type == 1:
-            if i + 8 > n:
-                break
-            out.append((field_num, "double", struct.unpack("<d", buf[i:i + 8])[0]))
-            i += 8
-        elif wire_type == 2:
-            length, i = _read_varint(buf, i)
-            if i + length > n:
-                break
-            out.append((field_num, "bytes", buf[i:i + length]))
-            i += length
-        elif wire_type == 5:
-            if i + 4 > n:
-                break
-            out.append((field_num, "float", struct.unpack("<f", buf[i:i + 4])[0]))
-            i += 4
-        else:
-            break
-        count += 1
-    return out, i
-
-
-def _decode_4_floats(buf: bytes) -> list[float]:
-    vals = []
-    i = 0
-    while i < len(buf):
-        i += 1  # skip the per-float protobuf tag byte
-        vals.append(struct.unpack("<f", buf[i:i + 4])[0])
-        i += 4
-    return vals
-
-
-def _parse_djmd_frame_quaternions(data: bytes) -> list[tuple[float, float, float, float]]:
-    """One quaternion (the last sample of that frame's IMU burst) per video
-    frame, in order — confirmed empirically to land one record per frame."""
-    i, n = 0, len(data)
-    frame_quats = []
-    while i < n:
-        try:
-            tag, i = _read_varint(data, i)
-        except IndexError:
-            break
-        field_num, wire_type = tag >> 3, tag & 0x7
-        if wire_type != 2:
-            break
-        length, i = _read_varint(data, i)
-        chunk = data[i:i + length]
-        i += length
-        if field_num != 3:
-            continue
-        sub = _decode_protobuf_fields(chunk, max_items=20)[0]
-        imu_list = [f[2] for f in sub if f[0] == 3 and f[1] == "bytes"]
-        if not imu_list:
-            continue
-        imu_sub = _decode_protobuf_fields(imu_list[0], max_items=20)[0]
-        inner_list = [f[2] for f in imu_sub if f[1] == "bytes"]
-        if not inner_list:
-            continue
-        inner = _decode_protobuf_fields(inner_list[0], max_items=2000)[0]
-        quads = [_decode_4_floats(f[2]) for f in inner if f[1] == "bytes" and len(f[2]) == 20]
-        if quads:
-            frame_quats.append(tuple(quads[-1]))
-    return frame_quats
 
 
 def correlate_signals(

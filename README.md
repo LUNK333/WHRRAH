@@ -9,19 +9,25 @@ to key out in another video editor.
 
 ## Setup
 
+Requires Python 3.11 specifically — pinned to this version (rather than a
+floating "3.10+") because `telemetry-parser`, used for Data Wizard gyro
+matching, currently only ships prebuilt wheels up to 3.11; newer Pythons would
+have to build it from source via a Rust toolchain. If `python --version` on
+your machine isn't 3.11, install it alongside whatever you already have and
+set up a venv so the right interpreter gets used consistently:
+
 ```
-pip install -r requirements.txt
-python source/WHRRAH.py
+py -3.11 -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe source/WHRRAH.py
 ```
 
-Requires Python 3.10+ (uses modern type-hint syntax).
+(In Git Bash, use `./.venv/Scripts/python.exe` instead of the backslash path.)
 
 **ffmpeg is optional but recommended** — it's used for muxing audio into a
-composited export and the Data Wizard's gyro-based sync matching for DJI
-footage. The app looks for `ffmpeg` on PATH (falls back to a couple of common
-Windows install locations). Without it, everything else still works;
-composited exports just come out silent, and wizard matching falls back to
-coarse EXIF-timestamp matching.
+composited export. The app looks for `ffmpeg` on PATH (falls back to a couple
+of common Windows install locations). Without it, composited exports just
+come out silent.
 
 **`.xrk` support requires `source/xrk_dll/`** (bundled in this repo) — a small
 wrapper around AiM's official `MatLabXRK` DLL. This is Windows-only; CSV logs work everywhere.
@@ -37,8 +43,8 @@ font so the export and the preview agree.
 You can skip the manual "Open CSV…" step by passing a data log on the command line:
 
 ```
-python source/WHRRAH.py path/to/log.csv
-python source/WHRRAH.py path/to/log.csv --layout path/to/layout.json
+.venv\Scripts\python.exe source/WHRRAH.py path/to/log.csv
+.venv\Scripts\python.exe source/WHRRAH.py path/to/log.csv --layout path/to/layout.json
 ```
 
 `source/default_layout.json` is loaded automatically on startup if it exists.
@@ -74,7 +80,9 @@ starts — automatically.
   - **Gyro correlation** When the video files have gyro data embedded, this function
     cross-correlates the video's gyro signal against the
     AiM's gyro signal, and syncs the video to the session using this signal. A confidence score
-    is displayed showing how good the match is.
+    is displayed showing how good the match is. Telemetry is extracted via
+    `telemetry-parser`, which covers DJI, GoPro, Insta360, and several other
+    action cameras.
 	-DJI Osmo Action cameras that I have tested this with will record gyro data when the FoV is set to Wide, 
 	 and internal video stabilization features are disabled.
   - **EXIF `creation_time`** as a fallback when gyro data isn't available.
@@ -88,10 +96,12 @@ starts — automatically.
   telemetry for every pairing again. Click **Find Matches** again if you've
   added/changed files in either folder.
 
-This can take a while on a large folder — gyro correlation means parsing the
-full telemetry stream for every video and every session it's still a
-candidate for. If you already know the session and video you want to load I recommend 
-moving them to their own folder and just using the wizard to sync footage to data.
+Gyro correlation means parsing telemetry for every video and every session
+it's still a candidate for, so a large folder still takes a moment, but
+extraction (via `telemetry-parser`) is fast — a handful of seconds for a full
+folder of multi-GB clips. If you already know the session and video you want
+to load I recommend moving them to their own folder and just using the wizard
+to sync footage to data.
 
 ## Loading video
 

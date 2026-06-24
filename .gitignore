@@ -1,5 +1,6 @@
 __pycache__/
 *.pyc
+.venv/
 *.mp4
 *.mov
 lap timer format.pdf
