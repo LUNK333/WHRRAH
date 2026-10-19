@@ -13,10 +13,12 @@ import ctypes
 import functools
 import json
 import math
+import queue
 import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -475,8 +477,12 @@ def match_video_to_session(video_path: str, video_duration: float, session_info:
     if session_rotation and video_gyro:
         overhang = max(0.0, video_duration - session_duration)
         max_offset = max(0.0, session_duration - video_duration)
+        # 120s buffer on each side: handles camera pre-roll/post-roll AND
+        # cases where the video spans a pit stop between two AIM sessions
+        # (the second session's true offset can be well past the nominal
+        # overhang if there was a long stationary gap in the middle).
         offset, corr = correlate_signals(session_rotation, video_gyro,
-                                         (-(overhang + 5.0), max_offset + 5.0))
+                                         (-(overhang + 120.0), max_offset + 120.0))
         return offset, corr, "gyro"
 
     # Fall back to EXIF creation_time, capped well below gyro-confirmed
@@ -551,6 +557,72 @@ def find_video_log_matches(aim_folder: str, video_folder: str,
         assignment[key] = {"xrk_path": key, "video_path": video_path,
                             "confidence": conf, "offset_sec": offset, "method": method}
 
+    # Second pass: detect sessions whose video was claimed by another session
+    # but which plausibly share it (one continuous recording spanning a pit
+    # stop or black flag between two AIM sessions).  Criteria:
+    #   1. Session is unmatched after greedy assignment.
+    #   2. It correlates reasonably (conf > 0.4) with a video already assigned
+    #      to a different session.
+    #   3. Chronological consistency: the implied video-local gap between the
+    #      two sessions (from their offsets + the primary session's duration)
+    #      is positive and within 2 hours, AND matches the real wall-clock gap
+    #      between their AIM start times within 5 minutes.
+    session_by_path = {s["path"]: s for s in sessions}
+    video_to_primary = {v["video_path"]: (k, v) for k, v in assignment.items() if v["video_path"]}
+
+    for session in sessions:
+        key = session["path"]
+        if key in assignment:
+            continue
+        best_cont_conf, best_cont = 0.0, None
+        for conf, s, video_path, offset, method in candidates:
+            if s["path"] != key or conf <= 0.4:
+                continue
+            if video_path not in video_to_primary:
+                continue
+            primary_key, primary_result = video_to_primary[video_path]
+            primary_session = session_by_path[primary_key]
+            primary_offset = primary_result["offset_sec"]
+            # In video-local time, each session's start = -offset (since
+            # session_time = video_time + offset → video_time = -offset).
+            # Determine which session is earlier in real time so we can
+            # compute the gap between the earlier session's end and the
+            # later session's start in video-local time.
+            try:
+                cand_is_earlier = session["start"] < primary_session["start"]
+            except Exception:
+                # No start timestamps — fall back to offset comparison.
+                cand_is_earlier = (-offset) < (-primary_offset)
+            if cand_is_earlier:
+                earlier_offset, earlier_dur = offset, session["duration"]
+                later_offset = primary_offset
+            else:
+                earlier_offset, earlier_dur = primary_offset, primary_session["duration"]
+                later_offset = offset
+            # Gap = start of later session in video − end of earlier session in video
+            implied_gap = (-later_offset) - (-earlier_offset + earlier_dur)
+            if not (0 < implied_gap < 7200):
+                continue
+            # Cross-check against wall-clock gap between the two AIM sessions.
+            try:
+                if cand_is_earlier:
+                    wall_gap = (primary_session["start"] - session["start"]).total_seconds() \
+                               - session["duration"]
+                else:
+                    wall_gap = (session["start"] - primary_session["start"]).total_seconds() \
+                               - primary_session["duration"]
+                if abs(implied_gap - wall_gap) > 300:  # 5-minute tolerance
+                    continue
+            except Exception:
+                pass  # no start-time metadata — skip the wall-clock check
+            if conf > best_cont_conf:
+                best_cont_conf = conf
+                best_cont = {"xrk_path": key, "video_path": video_path,
+                             "confidence": conf, "offset_sec": offset,
+                             "method": method, "is_continuation": True}
+        if best_cont:
+            assignment[key] = best_cont
+
     results = [
         assignment.get(s["path"], {"xrk_path": s["path"], "video_path": None,
                                     "confidence": 0.0, "offset_sec": 0.0, "method": "none"})
@@ -560,6 +632,7 @@ def find_video_log_matches(aim_folder: str, video_folder: str,
         result["completed_laps"] = session["completed_laps"]
         result["best_lap_num"] = session["best_lap_num"]
         result["best_lap_time"] = session["best_lap_time"]
+        result.setdefault("is_continuation", False)
     return results
 
 
@@ -1234,22 +1307,29 @@ def _draw_lap_timer(frame, x, y, w, h, lines, font_size, text_color):
     _render_text_region(frame, x, y, w, h, draw)
 
 
+_track_map_px_cache: dict = {}  # (id(data_log), x, y, w, h) → np.ndarray of shape (N,1,2) int32
+
+
 def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label="", font_size=BASE_FONT_SIZE, text_color=(255, 255, 255)):
-    lats = data_log.track_lat
-    lons = data_log.track_lon
-    if not lats or not lons:
+    if not data_log.track_bounds or not data_log.track_downsampled:
         return
 
-    lat_arr = np.array(lats)
-    lon_arr = np.array(lons)
-    lat_min, lat_max = lat_arr.min(), lat_arr.max()
-    lon_min, lon_max = lon_arr.min(), lon_arr.max()
+    lat_min, lat_max, lon_min, lon_max = data_log.track_bounds
     pad = 10
 
     def to_px(lat, lon):
         px = int((lon - lon_min) / (lon_max - lon_min + 1e-9) * (w - pad * 2)) + x + pad
         py = int((1 - (lat - lat_min) / (lat_max - lat_min + 1e-9)) * (h - pad * 2)) + y + pad
-        return (px, py)
+        return px, py
+
+    # Project the downsampled outline to pixel coords once per widget rect;
+    # reuse across frames since the track shape and widget bounds don't change.
+    cache_key = (id(data_log), x, y, w, h)
+    pts_array = _track_map_px_cache.get(cache_key)
+    if pts_array is None:
+        pts = [to_px(lat, lon) for lat, lon in data_log.track_downsampled]
+        pts_array = np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+        _track_map_px_cache[cache_key] = pts_array
 
     cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
 
@@ -1261,16 +1341,13 @@ def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label
 
         _render_text_region(frame, x, y, w, h, draw)
 
-    # Draw track outline
-    pts = [to_px(lat_arr[i], lon_arr[i]) for i in range(0, len(lat_arr), max(1, len(lat_arr) // 200))]
-    for i in range(1, len(pts)):
-        cv2.line(frame, pts[i - 1], pts[i], (150, 150, 150), 2, cv2.LINE_AA)
+    cv2.polylines(frame, [pts_array], isClosed=False, color=(150, 150, 150), thickness=2, lineType=cv2.LINE_AA)
 
     # Draw current position dot — held at the start/finish line during the
     # outlap (lap 0), since the car hasn't crossed the beacon yet. Red so it
     # survives chroma-keying against the green screen background.
     if data_log.lap_number_at(time_sec) == 0:
-        cur_lat, cur_lon = lat_arr[0], lon_arr[0]
+        cur_lat, cur_lon = data_log.track_lat[0], data_log.track_lon[0]
     else:
         cur_lat = data_log.value_at("GPS Latitude", time_sec)
         cur_lon = data_log.value_at("GPS Longitude", time_sec)
@@ -2380,7 +2457,7 @@ def _encoder_quality_args(encoder: str, w: int, h: int, fps: float) -> list[str]
     # on flat saturated colors like a bar-graph fill, since baseline's
     # entropy coding is just worse at representing flat regions efficiently.
     if encoder == "h264_nvenc":
-        return ["-preset", "p5", "-tune", "hq", "-profile:v", "high", "-rc", "vbr", "-cq", "19",
+        return ["-preset", "p3", "-tune", "hq", "-profile:v", "high", "-rc", "vbr", "-cq", "19",
                 "-b:v", str(bitrate), "-maxrate", str(maxrate), "-bufsize", str(bufsize)]
     if encoder == "h264_amf":
         return ["-quality", "quality", "-profile:v", "high", "-rc", "vbr_peak", "-qp_i", "18", "-qp_p", "20",
@@ -2444,6 +2521,104 @@ class _FfmpegPipeWriter:
 # ---------------------------------------------------------------------------
 # Export thread
 # ---------------------------------------------------------------------------
+
+class _DecodeThread(threading.Thread):
+    """Decodes video frames ahead of the composite loop and puts them into
+    a bounded queue so the GPU encoder is never starved waiting for a seek.
+    Each item is (target_msec, frame_or_None).  A sentinel None target_msec
+    signals end-of-stream."""
+
+    _QUEUE_DEPTH = 8  # frames buffered ahead; one 1080p BGR24 frame ≈ 6 MB
+
+    def __init__(self, cap, lap_windows, fps, video_offset, size, max_sequential_gap_ms,
+                 cancel_flag):
+        super().__init__(daemon=True)
+        self._cap = cap
+        self._lap_windows = lap_windows
+        self._fps = fps
+        self._video_offset = video_offset
+        self._size = size
+        self._max_gap = max_sequential_gap_ms
+        self._cancel = cancel_flag
+        self.queue: queue.Queue = queue.Queue(maxsize=self._QUEUE_DEPTH)
+        self._lb = _LetterboxHelper(size)
+
+    def run(self):
+        last_msec = -1.0
+        last_raw = None
+        try:
+            for start, end, _ in self._lap_windows:
+                n_frames = max(0, int((end - start) * self._fps))
+                for fi in range(n_frames):
+                    if self._cancel():
+                        self.queue.put((None, None))
+                        return
+                    t = start + fi / self._fps
+                    video_time = t - self._video_offset
+                    if video_time < 0:
+                        self.queue.put((t, None))  # None → use green screen
+                        continue
+                    target_msec = video_time * 1000.0
+                    delta = target_msec - last_msec
+                    frame = None
+                    if -200.0 <= delta < 0:
+                        frame = last_raw
+                    elif 0 <= delta <= self._max_gap:
+                        for _ in range(30):
+                            ok, f = self._cap.read()
+                            if not ok:
+                                break
+                            frame = f
+                            last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+                            if last_msec >= target_msec:
+                                break
+                    else:
+                        self._cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
+                        ok, frame = self._cap.read()
+                        if ok:
+                            last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
+                    if frame is not None:
+                        last_raw = frame
+                        frame = self._lb.apply(frame)
+                    self.queue.put((t, frame))
+        finally:
+            self.queue.put((None, None))  # end-of-stream sentinel
+
+
+class _LetterboxHelper:
+    """Same logic as ExportThread._letterbox but as a standalone object so
+    the decode thread can use it independently."""
+    def __init__(self, size):
+        self._size = size
+        self._params = None
+        self._canvas = None
+        self._resized = None
+        self._region = None
+
+    def apply(self, frame: np.ndarray) -> np.ndarray:
+        target_w, target_h = self._size
+        fh, fw = frame.shape[:2]
+        if fw <= 0 or fh <= 0:
+            return np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        params = (fw, fh, target_w, target_h)
+        if self._params != params:
+            scale = min(target_w / fw, target_h / fh)
+            new_w, new_h = max(1, int(fw * scale)), max(1, int(fh * scale))
+            x_off, y_off = (target_w - new_w) // 2, (target_h - new_h) // 2
+            self._params = params
+            self._canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+            self._resized = np.empty((new_h, new_w, 3), dtype=np.uint8)
+            self._region = (x_off, y_off, new_w, new_h)
+        x_off, y_off, new_w, new_h = self._region
+        cv2.resize(frame, (new_w, new_h), dst=self._resized)
+        # Copy into a fresh array each time — the composite loop mutates the
+        # frame (widgets draw into it, fade applies in-place), so the decode
+        # thread must not hand out a buffer it's still using.
+        out = np.empty((target_h, target_w, 3), dtype=np.uint8)
+        out[:] = 0
+        out[y_off:y_off + new_h, x_off:x_off + new_w] = self._resized
+        return out
+
 
 class ExportThread(QThread):
     progress = Signal(int)
@@ -2589,11 +2764,19 @@ class ExportThread(QThread):
                 # separate render-relative running total.
                 audio_start = max(0.0, start - self.video_offset)
                 seg_path = os.path.join(tmp_dir, f"seg_{len(segment_paths)}.m4a")
+                # Try stream-copy first (instant for AAC source like GoPro/DJI);
+                # fall back to re-encoding if the container doesn't allow it.
                 result = subprocess.run(
                     [ffmpeg_path, "-y", "-ss", f"{audio_start}", "-t", f"{duration}",
-                     "-i", self.video_path, "-vn", "-c:a", "aac", "-b:a", "192k", seg_path],
+                     "-i", self.video_path, "-vn", "-c:a", "copy", seg_path],
                     capture_output=True, text=True
                 )
+                if result.returncode != 0:
+                    result = subprocess.run(
+                        [ffmpeg_path, "-y", "-ss", f"{audio_start}", "-t", f"{duration}",
+                         "-i", self.video_path, "-vn", "-c:a", "aac", "-b:a", "192k", seg_path],
+                        capture_output=True, text=True
+                    )
                 if result.returncode != 0:
                     return f"Couldn't extract audio for export: {result.stderr[-500:]}"
                 segment_paths.append(seg_path)
@@ -2669,8 +2852,6 @@ class ExportThread(QThread):
                     self.error.emit(f"Could not open video for compositing:\n{self.video_path}")
                     return
                 w_max, h_max = self.output_size or (1920, 1080)
-                video_last_msec = -1.0
-                video_last_frame = None
             elif self.crop_rect is not None:
                 # A crop region is defined relative to the full overlay
                 # canvas, so that canvas has to actually be composited at
@@ -2696,22 +2877,27 @@ class ExportThread(QThread):
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(self.out_path, fourcc, self.fps, (crop_w, crop_h))
 
-            # Also used when video_cap is set but a positive offset means
-            # the video hasn't actually started yet at this point in the render.
             green = np.zeros((h_max, w_max, 3), dtype=np.uint8)
             green[:, :] = (0, 180, 0)  # pure BGR green screen
 
             total_duration_sec = total_frames / self.fps
-            # Clamped so a fade longer than half the render can't overlap
-            # itself (which would otherwise mean it never reaches full
-            # brightness before fading back out).
             fade_sec = min(self.fade_duration, total_duration_sec / 2) if self.fade_duration > 0 else 0.0
-            # Read by _mux_audio, after the frame loop, for the matching audio fade.
             self._fade_sec = fade_sec
             self._total_duration_sec = total_duration_sec
 
+            # Start decode thread so video I/O runs concurrently with
+            # widget compositing and GPU encoding.
+            decode_thread = None
+            if video_cap is not None:
+                decode_thread = _DecodeThread(
+                    video_cap, self.lap_windows, self.fps, self.video_offset,
+                    (w_max, h_max), self._MAX_SEQUENTIAL_GAP_MS,
+                    lambda: self._cancel_requested,
+                )
+                decode_thread.start()
+
             done = 0
-            sync_entries = []  # (lap_number, frame_idx, time_sec)
+            sync_entries = []
             for (start, _end, markers), n_frames in zip(self.lap_windows, frames_per_window):
                 for lap_number, marker_t in markers:
                     marker_frame_in_window = max(0, min(n_frames - 1, int(round((marker_t - start) * self.fps))))
@@ -2728,22 +2914,12 @@ class ExportThread(QThread):
                         return
                     t = start + frame_idx / self.fps
 
-                    if video_cap is not None:
-                        # video_offset is the video's own t=0 expressed as an
-                        # absolute session time (same basis the live preview
-                        # uses), so it's compared against the absolute time
-                        # `t`, not the render-relative frame count.
-                        video_time = t - self.video_offset
-                        if video_time < 0:
-                            # Positive offset means the video hasn't started
-                            # yet at this point — green screen, not frame 0.
-                            frame = green.copy()
-                        else:
-                            target_msec = video_time * 1000.0
-                            frame, video_last_msec, video_last_frame = self._video_frame_at(
-                                video_cap, video_last_msec, video_last_frame, target_msec, (w_max, h_max))
-                            if frame is None:
-                                frame = green.copy()
+                    if decode_thread is not None:
+                        _t, frame = decode_thread.queue.get()
+                        if _t is None:  # sentinel: decode thread bailed early
+                            frame = green
+                        elif frame is None:
+                            frame = green.copy()  # green screen for pre-roll frames
                     else:
                         frame = green.copy()
 
@@ -2759,7 +2935,7 @@ class ExportThread(QThread):
                         ww.render_to_frame(frame, dl, t)
 
                     if fade_factor < 1.0:
-                        frame = cv2.convertScaleAbs(frame, alpha=max(0.0, fade_factor))
+                        cv2.convertScaleAbs(frame, dst=frame, alpha=max(0.0, fade_factor))
                     out_frame = frame[crop_y:crop_y + crop_h, crop_x:crop_x + crop_w] if self.crop_rect is not None else frame
                     writer.write(out_frame)
                     done += 1
@@ -2767,6 +2943,8 @@ class ExportThread(QThread):
 
             writer.release()
             writer = None
+            if decode_thread is not None:
+                decode_thread.join(timeout=10)
             if video_cap is not None:
                 video_cap.release()
                 video_cap = None
@@ -3062,9 +3240,16 @@ class DataWizardDialog(QDialog):
         self.btn_find_matches.setEnabled(True)
         self._results = results
         self.table.setRowCount(len(results))
+        cont_color = QColor(80, 60, 20)   # amber tint for continuation rows
         for row, r in enumerate(results):
             session_name = Path(r["xrk_path"]).stem
-            video_name = Path(r["video_path"]).stem if r["video_path"] else "(no match found)"
+            is_cont = r.get("is_continuation", False)
+            if r["video_path"]:
+                video_name = Path(r["video_path"]).stem
+                if is_cont:
+                    video_name += " (cont.)"
+            else:
+                video_name = "(no match found)"
             confidence_pct = round(r["confidence"] * 100)
             laps_text = str(r.get("completed_laps", "")) if r.get("completed_laps") is not None else ""
             if r.get("best_lap_num") is not None:
@@ -3072,19 +3257,28 @@ class DataWizardDialog(QDialog):
             else:
                 best_lap_text = "—"
 
-            self.table.setItem(row, 0, QTableWidgetItem(session_name))
-            self.table.setItem(row, 1, QTableWidgetItem(video_name))
-            self.table.setItem(row, 2, QTableWidgetItem(laps_text))
-            self.table.setItem(row, 3, QTableWidgetItem(best_lap_text))
-            self.table.setItem(row, 4, QTableWidgetItem(f"{confidence_pct}%"))
+            items = [
+                QTableWidgetItem(session_name),
+                QTableWidgetItem(video_name),
+                QTableWidgetItem(laps_text),
+                QTableWidgetItem(best_lap_text),
+                QTableWidgetItem(f"{confidence_pct}%"),
+            ]
+            if is_cont:
+                for item in items:
+                    item.setBackground(cont_color)
+            for col, item in enumerate(items):
+                self.table.setItem(row, col, item)
 
             btn_load = QPushButton("Load")
             btn_load.setEnabled(r["video_path"] is not None)
             btn_load.clicked.connect(lambda checked, rr=r: self._on_load_clicked(rr))
             self.table.setCellWidget(row, 5, btn_load)
 
+        n_cont = sum(1 for r in results if r.get("is_continuation"))
         suffix = " (cached)" if from_cache else ""
-        self.lbl_status.setText(f"Found {len(results)} session(s).{suffix}")
+        cont_note = f", {n_cont} continuation(s)" if n_cont else ""
+        self.lbl_status.setText(f"Found {len(results)} session(s){cont_note}.{suffix}")
         if not from_cache:
             self.matches_cached.emit(self.txt_aim_folder.text(), self.txt_video_folder.text(), results)
 
@@ -3660,6 +3854,7 @@ class MainWindow(QMainWindow):
 
             # Completed laps only — the segment still in progress at t_end (if
             # any) doesn't count toward the lap total or the best-lap search.
+            t_end = self.data_log.timestamps[-1] if self.data_log.timestamps else 0.0
             total_laps = self.data_log.lap_number_at(t_end) if self.data_log.timestamps else 0
             lap_durations = [(n, d) for n in range(total_laps)
                               if (d := self.data_log.lap_duration(n)) is not None]
