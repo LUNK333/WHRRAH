@@ -24,6 +24,8 @@ from pathlib import Path
 
 import numpy as np
 import cv2
+import av
+from av.codec.hwaccel import HWAccel
 import telemetry_parser
 from PIL import Image, ImageDraw, ImageFont
 
@@ -1413,104 +1415,160 @@ def _fit_pt_for_text(text: str, max_w: float, max_h: float, bold: bool = False,
 # Canvas widget (the drag/drop overlay editor)
 # ---------------------------------------------------------------------------
 
+_HWACCEL_DEVICES = ("cuda", "d3d11va", "dxva2")
+
+
+def _open_av_video(path: str):
+    """Opens `path` with GPU decoding if any backend works, else threaded CPU.
+    On 2.7K HEVC DJI footage GPU decode makes an exact seek ~7x faster than
+    cv2.VideoCapture (~110 ms vs ~800 ms)."""
+    for dev in _HWACCEL_DEVICES:
+        try:
+            container = av.open(path, hwaccel=HWAccel(device_type=dev, allow_software_fallback=False))
+            stream = container.streams.video[0]
+            next(container.decode(stream))  # hwaccel failures only surface on first decode
+            container.seek(0, stream=stream, backward=True)
+            return container, stream
+        except Exception:
+            try:
+                container.close()
+            except Exception:
+                pass
+    container = av.open(path)
+    stream = container.streams.video[0]
+    stream.thread_type = "AUTO"
+    return container, stream
+
+
 class _VideoFrameWorker(QObject):
-    """Owns its own cv2.VideoCapture and does all decode/seek work for the
-    live preview on a background thread, so a slow keyframe-seek can never
-    stall painting or the playback timer on the GUI thread. Mirrors the
-    sequential-read-vs-seek heuristic OverlayCanvas used to run inline."""
+    """Owns a PyAV decoder and does all decode/seek work for the live preview
+    on a background thread, so a slow seek never stalls painting or the
+    playback timer on the GUI thread."""
 
     frameReady = pyqtSignal(QImage)
-    # Like requestFrame but skips the overshoot-tolerance branch — used by
-    # frame-step so a backward step always decodes the correct frame rather
-    # than returning the already-cached one.
-    requestFrameExact = pyqtSignal(float)
 
-    _MAX_SEQUENTIAL_READS = 30
-    _MAX_SEQUENTIAL_GAP_MS = 2000.0
-    _MAX_OVERSHOOT_MS = 200.0
+    _MAX_SEQUENTIAL_GAP = 2.0   # sec: decode forward instead of seeking
+    _MAX_OVERSHOOT = 0.2        # sec: reuse current frame when slightly behind it
+    _PREVIEW_MAX_W = 1920       # downscale for display; converting full 2.7K to RGB is wasted work
 
     def __init__(self):
         super().__init__()
-        self._cap: cv2.VideoCapture | None = None
-        self._last_msec = -1.0
-        self._last_frame = None
+        self._container = None
+        self._stream = None
+        self._frames = None      # live decode iterator, reset on every seek
+        self._last_t = -1.0
+        self._last_qimg: QImage | None = None
+        self._out_size: tuple[int, int] | None = None
+        self._half_frame = 0.02
+        # Written by the GUI thread just before each request is emitted, so a
+        # queued request can tell it's been superseded and skip its decode.
+        self._latest_t: float = -1.0
 
     def open_video(self, path: str):
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
-        self._last_msec = -1.0
-        self._last_frame = None
-        if path:
-            cap = cv2.VideoCapture(path)
-            if cap.isOpened():
-                self._cap = cap
+        self.close_video()
+        if not path:
+            return
+        try:
+            self._container, self._stream = _open_av_video(path)
+        except Exception:
+            self._container = self._stream = None
+            return
+        self._frames = self._container.decode(self._stream)
+        w, h = self._stream.codec_context.width, self._stream.codec_context.height
+        scale = min(1.0, self._PREVIEW_MAX_W / max(1, w))
+        self._out_size = (int(w * scale) // 2 * 2, int(h * scale) // 2 * 2)
+        rate = float(self._stream.average_rate or 30)
+        self._half_frame = 0.5 / rate
 
     def close_video(self):
-        if self._cap is not None:
-            self._cap.release()
-            self._cap = None
-        self._last_msec = -1.0
-        self._last_frame = None
+        if self._container is not None:
+            self._container.close()
+        self._container = self._stream = self._frames = None
+        self._last_t = -1.0
+        self._last_qimg = None
+
+    def _next_frame(self):
+        try:
+            f = next(self._frames)
+        except (StopIteration, av.error.EOFError):
+            return None
+        self._last_t = f.time if f.time is not None else self._last_t
+        return f
+
+    def _seek(self, t: float):
+        self._container.seek(int(max(0.0, t) / self._stream.time_base), stream=self._stream, backward=True)
+        self._frames = self._container.decode(self._stream)
+        self._last_t = -1.0
+
+    def _decode_until(self, t: float):
+        """Decodes forward until reaching `t`; None if superseded or EOF."""
+        f = None
+        while True:
+            if self._latest_t != t:
+                return None
+            nf = self._next_frame()
+            if nf is None:
+                return f
+            f = nf
+            if self._last_t >= t - self._half_frame:
+                return f
+
+    def _emit(self, f):
+        if f is None:
+            self.frameReady.emit(QImage())
+            return
+        w, h = self._out_size
+        arr = f.to_ndarray(format="rgb24", width=w, height=h)
+        qimg = QImage(arr.data, w, h, arr.strides[0], QImage.Format.Format_RGB888).copy()
+        self._last_qimg = qimg
+        self.frameReady.emit(qimg)
 
     def seek_request(self, t: float):
-        """Decodes whichever frame should be showing at video time `t` and
-        emits it back to the GUI thread. Emits a null QImage to mean "no
-        frame" (e.g. before the video's own t=0), which the GUI thread
-        treats as falling back to the green screen."""
-        if self._cap is None or t < 0:
+        """Playback path: decodes forward from the current position when the
+        target is just ahead, only seeking for real jumps. Emits a null
+        QImage for "no frame" (e.g. before the video's t=0)."""
+        if self._container is None or t < 0:
             self.frameReady.emit(QImage())
             return
-
-        target_msec = t * 1000.0
-        delta = target_msec - self._last_msec
-        frame = None
-
-        if -self._MAX_OVERSHOOT_MS <= delta < 0:
-            frame = self._last_frame
-        elif 0 <= delta <= self._MAX_SEQUENTIAL_GAP_MS:
-            for _ in range(self._MAX_SEQUENTIAL_READS):
-                ok, f = self._cap.read()
-                if not ok:
-                    break
-                frame = f
-                self._last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
-                if self._last_msec >= target_msec:
-                    break
-        else:
-            self._cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
-            ok, frame = self._cap.read()
-            if ok:
-                self._last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
-
-        if frame is None:
-            self.frameReady.emit(QImage())
+        if self._latest_t != t:
             return
-
-        self._last_frame = frame
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = frame.shape
-        qimg = QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
-        self.frameReady.emit(qimg)
+        delta = t - self._last_t
+        if -self._MAX_OVERSHOOT <= delta <= self._half_frame and self._last_qimg is not None:
+            self.frameReady.emit(self._last_qimg)
+            return
+        if not (0 <= delta <= self._MAX_SEQUENTIAL_GAP):
+            self._seek(t)
+        f = self._decode_until(t)
+        if self._latest_t == t:
+            self._emit(f)
 
     def seek_exact(self, t: float):
-        """Like seek_request but always does a full seek — skips the overshoot
-        tolerance branch so intentional backward steps decode the correct frame."""
-        if self._cap is None or t < 0:
+        """Always lands on the exact frame at `t` (frame-step, scrub release)."""
+        if self._container is None or t < 0:
             self.frameReady.emit(QImage())
             return
-        target_msec = t * 1000.0
-        self._cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
-        ok, frame = self._cap.read()
-        if not ok:
+        if self._latest_t != t:
+            return
+        delta = t - self._last_t
+        if abs(delta) <= self._half_frame and self._last_qimg is not None:
+            self.frameReady.emit(self._last_qimg)
+            return
+        if not (0 <= delta <= self._MAX_SEQUENTIAL_GAP):
+            self._seek(t)
+        f = self._decode_until(t)
+        if self._latest_t == t:
+            self._emit(f)
+
+    def seek_keyframe(self, t: float):
+        """Fast, approximate: shows the keyframe at or before `t`. Used while
+        dragging the scrubber, where an exact decode each move would lag."""
+        if self._container is None or t < 0:
             self.frameReady.emit(QImage())
             return
-        self._last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
-        self._last_frame = frame
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w, _ = frame.shape
-        qimg = QImage(frame.data, w, h, frame.strides[0], QImage.Format.Format_RGB888).copy()
-        self.frameReady.emit(qimg)
+        if self._latest_t != t:
+            return
+        self._seek(t)
+        self._emit(self._next_frame())
 
 
 class OverlayCanvas(QWidget):
@@ -1519,6 +1577,7 @@ class OverlayCanvas(QWidget):
     selection_changed = pyqtSignal(object)  # emits selected OverlayWidget or None
     requestFrame = pyqtSignal(float)       # -> _VideoFrameWorker.seek_request
     requestFrameExact = pyqtSignal(float)  # -> _VideoFrameWorker.seek_exact (bypasses overshoot)
+    requestFrameKeyframe = pyqtSignal(float)  # -> _VideoFrameWorker.seek_keyframe (fast drag preview)
     _openVideoRequested = pyqtSignal(str)  # -> _VideoFrameWorker.open_video
     _closeVideoRequested = pyqtSignal()    # -> _VideoFrameWorker.close_video
 
@@ -1555,6 +1614,7 @@ class OverlayCanvas(QWidget):
         self._video_cap: cv2.VideoCapture | None = None
         self._video_offset = 0.0
         self._exact_seek_pending = False
+        self._keyframe_seek = False
         self._last_paint_time: float | None = None
         self.fps = 0.0
         self.frametime_ms = 0.0
@@ -1567,6 +1627,7 @@ class OverlayCanvas(QWidget):
         self._video_worker.moveToThread(self._video_thread)
         self.requestFrame.connect(self._video_worker.seek_request)
         self.requestFrameExact.connect(self._video_worker.seek_exact)
+        self.requestFrameKeyframe.connect(self._video_worker.seek_keyframe)
         self._openVideoRequested.connect(self._video_worker.open_video)
         self._closeVideoRequested.connect(self._video_worker.close_video)
         self._video_worker.frameReady.connect(self._on_frame_ready)
@@ -1626,17 +1687,20 @@ class OverlayCanvas(QWidget):
     def set_data_log(self, dl: DataLog):
         self._data_log = dl
 
-    def set_preview_time(self, t: float, progress_sec: float | None = None, exact_seek: bool = False):
+    def set_preview_time(self, t: float, progress_sec: float | None = None,
+                         exact_seek: bool = False, keyframe_seek: bool = False):
         """t is the absolute data-log time, used to look up widget channel
         values. progress_sec is the zero-based time since the start of the
         selected lap range (or the whole log if no lap is selected) — that's
         the basis the video offset is measured against, so dialing in an
         offset means the same thing regardless of which lap you're viewing.
         exact_seek=True forces a full video seek (used by frame-step so
-        backward steps always decode the correct frame)."""
+        backward steps always decode the correct frame). keyframe_seek=True
+        shows the nearest keyframe instead, for fast scrubber dragging."""
         self._preview_time = t
         self._preview_progress_sec = progress_sec if progress_sec is not None else t
         self._exact_seek_pending = exact_seek
+        self._keyframe_seek = keyframe_seek
         self.update()
 
     def set_video(self, path: str | None):
@@ -1730,7 +1794,16 @@ class OverlayCanvas(QWidget):
         # lands) and paint whatever's already decoded right now, rather than
         # blocking this paint on a possibly-slow seek/decode.
         vt = self.video_time_for(self._preview_time)
-        if self._exact_seek_pending:
+        # Written from the GUI thread before emitting so the worker can drop
+        # requests that a newer one has already superseded.
+        self._video_worker._latest_t = vt
+        if self._keyframe_seek:
+            # Dragging the scrubber: show the nearest keyframe now; the next
+            # repaint (triggered by that frame landing) refines to exact.
+            self._keyframe_seek = False
+            self._exact_seek_pending = False
+            self.requestFrameKeyframe.emit(vt)
+        elif self._exact_seek_pending:
             self._exact_seek_pending = False
             self.requestFrameExact.emit(vt)
         else:
@@ -2981,6 +3054,37 @@ class ExportThread(QThread):
 # Lap tick bar (clickable lap-start markers under the scrubber)
 # ---------------------------------------------------------------------------
 
+class _ScrubSlider(QSlider):
+    """Jumps to the clicked position (instead of stepping by pageStep) and
+    signals release so the owner can do one exact seek after a drag."""
+
+    scrub_released = pyqtSignal()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(True)
+            self._jump_to(event.position().x())
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._jump_to(event.position().x())
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setSliderDown(False)
+            self.scrub_released.emit()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def _jump_to(self, x: float):
+        ratio = max(0.0, min(1.0, x / max(1, self.width())))
+        self.setValue(int(self.minimum() + ratio * (self.maximum() - self.minimum())))
+
+
 class LapTickBar(QWidget):
     """Thin strip under the scrubber with a clickable tick at the start of each lap."""
 
@@ -3565,9 +3669,10 @@ class MainWindow(QMainWindow):
         self.cmb_speed.addItems(["1x", "2x", "4x"])
         self.cmb_speed.currentTextChanged.connect(self._on_speed_changed)
         self.lbl_time = QLabel("0.00 s")
-        self.scrubber = QSlider(Qt.Orientation.Horizontal)
+        self.scrubber = _ScrubSlider(Qt.Orientation.Horizontal)
         self.scrubber.setRange(0, 1000)
         self.scrubber.valueChanged.connect(self._on_scrub)
+        self.scrubber.scrub_released.connect(self._on_scrub_settled)
         self.scrubber.installEventFilter(self)
         self.lap_ticks = LapTickBar()
         self.lap_ticks.lap_start_clicked.connect(self._on_lap_tick_clicked)
@@ -3606,6 +3711,7 @@ class MainWindow(QMainWindow):
         self.playback_speed = 1.0
         self._play_start_progress = 0.0
         self._play_start_wallclock = 0.0
+        self._audio_resync_pending = False
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(33)  # ~30 ticks/sec
         self._play_timer.timeout.connect(self._on_play_tick)
@@ -3692,8 +3798,20 @@ class MainWindow(QMainWindow):
         if total > 0:
             self._preview_progress_sec = val / 1000.0 * total
             t = self._progress_seconds_to_time(self._preview_progress_sec)
-            self.canvas.set_preview_time(t, self._preview_progress_sec)
+            dragging = self.scrubber.isSliderDown()
+            # While dragging, the video shows nearest keyframes; the audio
+            # position catches up on release along with an exact seek.
+            self.canvas.set_preview_time(t, self._preview_progress_sec,
+                                         exact_seek=not dragging, keyframe_seek=dragging)
             self.lbl_time.setText(f"{self._preview_progress_sec:.2f} s")
+            if not dragging:
+                self._sync_audio_position(t)
+
+    def _on_scrub_settled(self):
+        total = self._preview_total_duration()
+        if total > 0:
+            t = self._progress_seconds_to_time(self._preview_progress_sec)
+            self.canvas.set_preview_time(t, self._preview_progress_sec, exact_seek=True)
             self._sync_audio_position(t)
 
     def _on_lap_tick_clicked(self, progress_sec: float):
@@ -3708,8 +3826,13 @@ class MainWindow(QMainWindow):
             self.media_player.setPlaybackRate(self.playback_speed)
 
     def _sync_audio_position(self, absolute_t: float):
+        # Re-anchor the playback clock at every seek so a running playback
+        # continues from here rather than snapping back.
+        self._play_start_progress = self._preview_progress_sec
+        self._play_start_wallclock = time.monotonic()
         if self.media_player.source().isEmpty():
             return
+        self._audio_resync_pending = True
         self.media_player.setPosition(int(self.canvas.video_time_for(absolute_t) * 1000))
 
     def _on_play_clicked(self):
@@ -3754,13 +3877,23 @@ class MainWindow(QMainWindow):
         # clock means video frames are simply whatever the still-on-time
         # audio says they should be, and audio itself is never touched
         # during playback.
+        if self.scrubber.isSliderDown():
+            return  # user is dragging; don't fight them for the playhead
+        elapsed = time.monotonic() - self._play_start_wallclock
+        wall_progress = min(self._play_start_progress + elapsed * self.playback_speed, total)
         if not self.media_player.source().isEmpty():
             absolute_t = self.media_player.position() / 1000.0 + self.canvas._video_offset
-            self._preview_progress_sec = min(self._time_to_progress_seconds(absolute_t), total)
+            audio_progress = min(self._time_to_progress_seconds(absolute_t), total)
+            # setPosition() lands asynchronously, so right after a seek the
+            # audio clock still reports the old spot — follow the wall clock
+            # until it catches up instead of snapping the playhead back.
+            if self._audio_resync_pending and abs(audio_progress - wall_progress) > 0.25:
+                self._preview_progress_sec = wall_progress
+            else:
+                self._audio_resync_pending = False
+                self._preview_progress_sec = audio_progress
         else:
-            elapsed = time.monotonic() - self._play_start_wallclock
-            self._preview_progress_sec = min(
-                self._play_start_progress + elapsed * self.playback_speed, total)
+            self._preview_progress_sec = wall_progress
 
         t = self._progress_seconds_to_time(self._preview_progress_sec)
 
