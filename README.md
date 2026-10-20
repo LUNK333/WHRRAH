@@ -9,20 +9,24 @@ to key out in another video editor.
 
 ## Setup
 
-Requires Python 3.11 specifically — pinned to this version (rather than a
-floating "3.10+") because `telemetry-parser`, used for Data Wizard gyro
-matching, currently only ships prebuilt wheels up to 3.11; newer Pythons would
-have to build it from source via a Rust toolchain. If `python --version` on
-your machine isn't 3.11, install it alongside whatever you already have and
-set up a venv so the right interpreter gets used consistently:
+Requires 64-bit Windows and Python 3.9 or newer. From the repo root:
 
 ```
-py -3.11 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-.venv\Scripts\python.exe source/WHRRAH.py
+py -m pip install -r requirements.txt
+py source/WHRRAH.py
 ```
 
-(In Git Bash, use `./.venv/Scripts/python.exe` instead of the backslash path.)
+`telemetry-parser` (used for Data Wizard gyro matching) is installed from a
+prebuilt wheel in `vendor/` rather than PyPI, whose release only supports up to
+Python 3.12. It's built from the upstream repo's `bin/python-module` as a
+stable-ABI wheel, so the one file works on any Python ≥ 3.9. To rebuild it
+(needs Rust and the Visual Studio C++ Build Tools):
+
+```
+py -m pip install maturin
+cd telemetry-parser/bin/python-module
+py -m maturin build --release --features pyo3/abi3-py39
+```
 
 **ffmpeg is optional but recommended** — it's used for muxing audio into a
 composited export. The app looks for `ffmpeg` on PATH (falls back to a couple
@@ -43,8 +47,8 @@ font so the export and the preview agree.
 You can skip the manual "Open CSV…" step by passing a data log on the command line:
 
 ```
-.venv\Scripts\python.exe source/WHRRAH.py path/to/log.csv
-.venv\Scripts\python.exe source/WHRRAH.py path/to/log.csv --layout path/to/layout.json
+py source/WHRRAH.py path/to/log.csv
+py source/WHRRAH.py path/to/log.csv --layout path/to/layout.json
 ```
 
 `source/default_layout.json` is loaded automatically on startup if it exists.

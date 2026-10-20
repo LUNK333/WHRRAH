@@ -3,4 +3,7 @@ opencv-python>=4.8.0
 av>=14.0.0
 numpy>=1.24.0
 Pillow>=10.1.0
-telemetry-parser>=0.3.0
+# Prebuilt from github.com/AdrianEddy/telemetry-parser (bin/python-module) as a
+# stable-ABI wheel: works on any 64-bit Windows Python >= 3.9. PyPI's 0.3.0
+# only has wheels up to 3.12. Path is relative to the repo root.
+./vendor/telemetry_parser-0.4.0-cp39-abi3-win_amd64.whl
