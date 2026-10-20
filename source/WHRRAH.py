@@ -34,14 +34,14 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QFileDialog, QListWidget, QListWidgetItem,
     QComboBox, QSlider, QSpinBox, QGroupBox, QSplitter, QScrollArea,
     QDoubleSpinBox, QCheckBox, QStatusBar, QToolBar, QFrame,
-    QDialog, QDialogButtonBox, QFormLayout, QProgressDialog,
+    QDialog, QDialogButtonBox, QFormLayout, QProgressDialog, QProgressBar,
     QMessageBox, QColorDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QRect, QPoint, QSize, QTimer, QUrl, QSettings, pyqtSignal, QThread, QObject, pyqtSignal as Signal
+from PyQt6.QtCore import Qt, QRect, QPoint, QPointF, QSize, QTimer, QUrl, QSettings, pyqtSignal, QThread, QObject, pyqtSignal as Signal
 from PyQt6.QtGui import (
     QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPixmap, QImage,
-    QAction, QCursor, QDesktopServices
+    QAction, QCursor, QDesktopServices, QPolygonF
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
@@ -676,6 +676,7 @@ class DataLog:
         """Load CSV, return list of detected channel names."""
         self.filepath = filepath
         self.channels = {}
+        self._np_cache = {}
         self.timestamps = []
         self.beacon_markers = []
         self.track_lat = []
@@ -772,6 +773,7 @@ class DataLog:
 
         self.filepath = filepath
         self.channels = {}
+        self._np_cache = {}
         self.timestamps = []
         self.beacon_markers = []
         self.track_lat = []
@@ -923,6 +925,27 @@ class DataLog:
         durations = [d for n in range(current_lap) if (d := self.lap_duration(n)) is not None]
         return min(durations) if durations else None
 
+    def trace_values(self, channel: str, t_start: float, t_end: float, n: int):
+        """(fractions, values) for n evenly spaced samples over
+        [t_start, t_end]; fractions are 0..1 positions across that span.
+        Samples outside the log are dropped rather than clamped, so the trace
+        doesn't draw a fake flat line past either end. None if no data."""
+        window = t_end - t_start
+        if channel not in self.channels or len(self.timestamps) < 2 or window <= 0:
+            return None
+        cache = self.__dict__.setdefault("_np_cache", {})
+        vals_list = self.channels[channel]
+        ts, vs = cache.get("__t__"), cache.get(channel)
+        if ts is None or len(ts) != len(self.timestamps):
+            ts = cache["__t__"] = np.asarray(self.timestamps, dtype=np.float64)
+        if vs is None or len(vs) != len(vals_list):
+            vs = cache[channel] = np.asarray(vals_list, dtype=np.float64)
+        lo, hi = max(t_start, ts[0]), min(t_end, ts[-1])
+        if hi <= lo:
+            return None
+        times = np.linspace(lo, hi, n)
+        return (times - t_start) / window, np.interp(times, ts, vs)
+
     def channel_range(self, channel: str) -> tuple[float, float]:
         if channel not in self.channels:
             return (0.0, 1.0)
@@ -934,7 +957,10 @@ class DataLog:
 # Widget definitions
 # ---------------------------------------------------------------------------
 
-WIDGET_TYPES = ["Lap Timer", "Numeric Display", "Bar Graph", "Track Map"]
+WIDGET_TYPES = ["Lap Timer", "Numeric Display", "Bar Graph", "Track Map", "Data Trace"]
+
+# Widgets whose width and height scale independently (corner drag / Scale X+Y).
+FREE_ASPECT_TYPES = ("Bar Graph", "Data Trace")
 
 # Unscaled (scale=1.0) size per widget type — actual w/h/font_size are this times .scale_x/.scale_y.
 BASE_SIZES = {
@@ -942,6 +968,7 @@ BASE_SIZES = {
     "Numeric Display": (200, 60),
     "Bar Graph": (200, 60),
     "Track Map": (220, 220),
+    "Data Trace": (300, 100),
 }
 BASE_FONT_SIZE = 24
 
@@ -1060,6 +1087,9 @@ class OverlayWidget:
         # ("XXX") and the label beneath it, rather than tying the label to
         # whatever the corner-drag scale computes for the value.
         self.label_font_size: int = 16
+        self.trace_window: float = 3.0  # Data Trace: seconds of history shown
+        if widget_type == "Data Trace":
+            self.color = (0, 200, 255)  # amber; green would vanish when chroma-keyed
         self._size_sig = None
         self._size_cached = (1, 1)
 
@@ -1196,6 +1226,9 @@ class OverlayWidget:
         elif self.widget_type == "Track Map":
             if "GPS Latitude" in data_log.channels and "GPS Longitude" in data_log.channels:
                 _draw_track_map(frame, x, y, w, h, data_log, time_sec, self.label, self.font_size, self.text_color)
+
+        elif self.widget_type == "Data Trace":
+            _draw_data_trace(frame, x, y, w, h, self, data_log, time_sec)
 
 
 # ---------------------------------------------------------------------------
@@ -1355,6 +1388,68 @@ def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label
         cur_lon = data_log.value_at("GPS Longitude", time_sec)
     dot = to_px(cur_lat, cur_lon)
     cv2.circle(frame, dot, 6, (0, 0, 255), -1, cv2.LINE_AA)
+
+
+def _data_trace_geometry(data_log: "DataLog", widget: "OverlayWidget", time_sec: float,
+                         x: float, y: float, w: float, h: float):
+    """Shared by the export renderer and the live preview so both plot the
+    same thing. The window is centred on the present, so half of it shows
+    what's coming up. Returns (xs, ys, now_y, label_px, (px0, py0, px1, py1))
+    — point coordinates in the caller's pixel space, the y of the present
+    value (at the plot's horizontal centre), the label font size, and the
+    plot area — or None when there's nothing to plot."""
+    pad = max(3.0, min(w, h) * 0.06)
+    label_px = max(8, int(h * 0.18)) if widget.label else 0
+    px0, px1 = x + pad, x + w - pad
+    py0, py1 = y + pad + label_px, y + h - pad
+    if px1 - px0 < 2 or py1 - py0 < 2 or not widget.channel or data_log is None:
+        return None
+    n = int(max(20, min(300, (px1 - px0) // 2)))
+    half = widget.trace_window / 2
+    res = data_log.trace_values(widget.channel, time_sec - half, time_sec + half, n)
+    if res is None:
+        return None
+    frac, vals = res
+    lo, hi = widget.min_val, widget.max_val
+    span = (hi - lo) or 1.0
+
+    def to_y(v):
+        return py1 - np.clip((v - lo) / span, 0.0, 1.0) * (py1 - py0)
+
+    xs = px0 + frac * (px1 - px0)
+    now_y = float(to_y(data_log.value_at(widget.channel, time_sec)))
+    return xs, to_y(vals), now_y, label_px, (px0, py0, px1, py1)
+
+
+def _draw_data_trace(frame, x, y, w, h, widget: "OverlayWidget", data_log: "DataLog", time_sec: float):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
+    geom = _data_trace_geometry(data_log, widget, time_sec, x, y, w, h)
+    label_px = max(8, int(h * 0.18)) if widget.label else 0
+    if widget.label:
+        rgb = tuple(reversed(widget.text_color))
+
+        def draw(d: ImageDraw.ImageDraw, rx, ry, rw, rh):
+            _pil_draw_text(d, (rx + 6, ry + 4), widget.label, _get_pil_font(label_px), rgb)
+
+        _render_text_region(frame, x, y, w, h, draw)
+    if geom is None:
+        return
+    xs, ys, now_y, _, (px0, py0, px1, py1) = geom
+    grid = (60, 60, 60)
+    cv2.line(frame, (int(px0), int(py0)), (int(px1), int(py0)), grid, 1)
+    cv2.line(frame, (int(px0), int(py1)), (int(px1), int(py1)), grid, 1)
+    cx = (px0 + px1) / 2
+    cv2.line(frame, (int(round(cx)), int(py0)), (int(round(cx)), int(py1)), (170, 170, 170), 1, cv2.LINE_AA)
+
+    thickness = max(1, int(round(2 * widget.scale_y)))
+    future_color = tuple(int(c * 0.45) for c in widget.color)
+    split = int(np.searchsorted(xs, cx))
+    for seg_x, seg_y, color in ((xs[:split + 1], ys[:split + 1], widget.color),
+                                (xs[split:], ys[split:], future_color)):
+        if len(seg_x) >= 2:
+            pts = np.stack([seg_x, seg_y], axis=1).round().astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(frame, [pts], isClosed=False, color=color, thickness=thickness, lineType=cv2.LINE_AA)
+    cv2.circle(frame, (int(round(cx)), int(round(now_y))), thickness + 2, widget.color, -1, cv2.LINE_AA)
 
 
 def _track_map_layout(data_log: "DataLog", rect: QRect, time_sec: float):
@@ -1878,6 +1973,43 @@ class OverlayCanvas(QWidget):
                 if bar_w > 0:
                     painter.fillRect(QRect(inner.x(), inner.y(), bar_w, inner.height()), bar_color)
 
+            elif w.widget_type == "Data Trace":
+                geom = _data_trace_geometry(self._data_log, w, wt, rect.x(), rect.y(),
+                                            rect.width(), rect.height())
+                label_px = max(8, int(rect.height() * 0.18)) if w.label else 0
+                if w.label:
+                    label_font = QFont("Monospace")
+                    label_font.setPixelSize(label_px)
+                    painter.setFont(label_font)
+                    painter.setPen(QPen(QColor(*reversed(w.text_color))))
+                    painter.drawText(rect.adjusted(6, 4, -4, -4),
+                                     Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, w.label)
+                if geom is not None:
+                    xs, ys, now_y, _, (px0, py0, px1, py1) = geom
+                    painter.setPen(QPen(QColor(60, 60, 60), 1))
+                    painter.drawLine(QPointF(px0, py0), QPointF(px1, py0))
+                    painter.drawLine(QPointF(px0, py1), QPointF(px1, py1))
+                    cx = (px0 + px1) / 2
+                    painter.setPen(QPen(QColor(170, 170, 170), 1))
+                    painter.drawLine(QPointF(cx, py0), QPointF(cx, py1))
+
+                    trace_color = QColor(*reversed(w.color))
+                    future_color = QColor(*(int(c * 0.45) for c in reversed(w.color)))
+                    width = max(1.0, 2 * w.scale_y * s)
+                    split = int(np.searchsorted(xs, cx))
+                    for seg_x, seg_y, color in ((xs[:split + 1], ys[:split + 1], trace_color),
+                                                (xs[split:], ys[split:], future_color)):
+                        if len(seg_x) >= 2:
+                            pen = QPen(color)
+                            pen.setWidthF(width)
+                            painter.setPen(pen)
+                            painter.drawPolyline(QPolygonF([QPointF(px, py) for px, py in zip(seg_x, seg_y)]))
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.setBrush(trace_color)
+                    r = width + 2
+                    painter.drawEllipse(QPointF(cx, now_y), r, r)
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+
             # Label
             painter.setPen(QPen(QColor(220, 220, 220)))
             pt_size = max(6, int(w.font_size / BASE_FONT_SIZE * 10 * s))
@@ -1990,7 +2122,7 @@ class OverlayCanvas(QWidget):
                 label_rect = QRect(inner.x(), value_rect.bottom() + 2, inner.width(), label_h_budget)
                 painter.setFont(label_font)
                 painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, w.label)
-            else:
+            elif w.widget_type != "Data Trace":  # Data Trace draws its own label above
                 painter.drawText(rect.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                  w.label)
 
@@ -2102,8 +2234,8 @@ class OverlayCanvas(QWidget):
                 new_w = max(20, ox - self.selected.x)
                 new_h = max(10, oy - self.selected.y)
                 prev_sx, prev_sy = self.selected.scale_x, self.selected.scale_y
-                if self.selected.widget_type == "Bar Graph":
-                    # Bar Graph supports independent x/y scaling via corner drag.
+                if self.selected.widget_type in FREE_ASPECT_TYPES:
+                    # Independent x/y scaling via corner drag.
                     self.selected.scale_x = max(0.2, new_w / base_w)
                     self.selected.scale_y = max(0.2, new_h / base_h)
                 else:
@@ -2269,6 +2401,15 @@ class PropertiesPanel(QWidget):
         self.spn_label_font_size.valueChanged.connect(self._on_label_font_size)
         layout.addRow("Label Font Size:", self.spn_label_font_size)
 
+        self.spn_trace_window = QDoubleSpinBox()
+        self.spn_trace_window.setRange(0.5, 60.0)
+        self.spn_trace_window.setSingleStep(0.5)
+        self.spn_trace_window.setDecimals(1)
+        self.spn_trace_window.setSuffix(" s")
+        self.spn_trace_window.setValue(3.0)
+        self.spn_trace_window.valueChanged.connect(self._on_trace_window)
+        layout.addRow("Time Window:", self.spn_trace_window)
+
         # Shifts just this widget's data lookup — fixes channels (e.g. CAN
         # bus data) that lag behind GPS-derived ones, without touching the
         # shared scrubber timeline or video sync.
@@ -2291,6 +2432,7 @@ class PropertiesPanel(QWidget):
         self._set_row_visible(self.spn_scale_y, False)
         self._set_row_visible(self.spn_decimals, False)
         self._set_row_visible(self.spn_label_font_size, False)
+        self._set_row_visible(self.spn_trace_window, False)
         self.setEnabled(False)
 
     def set_channels(self, channels: list[str]):
@@ -2312,14 +2454,16 @@ class PropertiesPanel(QWidget):
         self.txt_label.blockSignals(True); self.txt_label.setText(w.label); self.txt_label.blockSignals(False)
         self._update_color_swatch(w.color)
         is_bar = w.widget_type == "Bar Graph"
+        is_trace = w.widget_type == "Data Trace"
+        free_aspect = w.widget_type in FREE_ASPECT_TYPES
         is_lap_timer = w.widget_type == "Lap Timer"
-        has_text_color = w.widget_type in ("Lap Timer", "Bar Graph", "Numeric Display")
+        has_text_color = w.widget_type in ("Lap Timer", "Bar Graph", "Numeric Display", "Data Trace")
         no_channel = is_lap_timer or w.widget_type == "Track Map"
         # Track Map doesn't render anything in widget.color — the generic
         # Color picker is otherwise the fill (Bar Graph) / border (Numeric
         # Display) color; Text Color is separate and used by all three
         # text-bearing widget types.
-        self._set_row_visible(self.btn_color, w.widget_type in ("Bar Graph", "Numeric Display"))
+        self._set_row_visible(self.btn_color, w.widget_type in ("Bar Graph", "Numeric Display", "Data Trace"))
         self.chk_show_value.setVisible(is_bar)
         self.chk_show_value.blockSignals(True); self.chk_show_value.setChecked(w.show_value); self.chk_show_value.blockSignals(False)
 
@@ -2337,9 +2481,13 @@ class PropertiesPanel(QWidget):
         self.spn_scale.blockSignals(True); self.spn_scale.setValue(w.scale_x); self.spn_scale.blockSignals(False)
         self.spn_scale_x.blockSignals(True); self.spn_scale_x.setValue(w.scale_x); self.spn_scale_x.blockSignals(False)
         self.spn_scale_y.blockSignals(True); self.spn_scale_y.setValue(w.scale_y); self.spn_scale_y.blockSignals(False)
-        self._set_row_visible(self.spn_scale, not is_bar)
-        self._set_row_visible(self.spn_scale_x, is_bar)
-        self._set_row_visible(self.spn_scale_y, is_bar)
+        self._set_row_visible(self.spn_scale, not free_aspect)
+        self._set_row_visible(self.spn_scale_x, free_aspect)
+        self._set_row_visible(self.spn_scale_y, free_aspect)
+        self._set_row_visible(self.spn_trace_window, is_trace)
+        self.spn_trace_window.blockSignals(True)
+        self.spn_trace_window.setValue(w.trace_window)
+        self.spn_trace_window.blockSignals(False)
         self.spn_min.blockSignals(True); self.spn_min.setValue(w.min_val); self.spn_min.blockSignals(False)
         self.spn_max.blockSignals(True); self.spn_max.setValue(w.max_val); self.spn_max.blockSignals(False)
         self.spn_time_offset.blockSignals(True); self.spn_time_offset.setValue(w.time_offset); self.spn_time_offset.blockSignals(False)
@@ -2357,6 +2505,11 @@ class PropertiesPanel(QWidget):
         self.cmb_channel.setEnabled(not no_channel)
         self.spn_min.setEnabled(not no_channel)
         self.spn_max.setEnabled(not no_channel)
+
+    def _on_trace_window(self, value):
+        if self._widget:
+            self._widget.trace_window = value
+            self.changed.emit()
 
     def _on_show_value(self, checked):
         if self._widget:
@@ -2409,7 +2562,7 @@ class PropertiesPanel(QWidget):
             self._widget.channel = text if text != "(none)" else ""
             # Scale the bar off the channel's actual range (e.g. PEDAL POSITION's
             # observed min/max) instead of leaving it at the 0–100 default.
-            if self._widget.widget_type == "Bar Graph" and self._widget.channel and self._data_log:
+            if self._widget.widget_type in FREE_ASPECT_TYPES and self._widget.channel and self._data_log:
                 lo, hi = self._data_log.channel_range(self._widget.channel)
                 self._widget.min_val = lo
                 self._widget.max_val = hi
@@ -2602,102 +2755,86 @@ class _DecodeThread(threading.Thread):
     signals end-of-stream."""
 
     _QUEUE_DEPTH = 8  # frames buffered ahead; one 1080p BGR24 frame ≈ 6 MB
+    _MAX_SEQUENTIAL_GAP = 2.0  # sec: decode forward instead of seeking
 
-    def __init__(self, cap, lap_windows, fps, video_offset, size, max_sequential_gap_ms,
-                 cancel_flag):
+    def __init__(self, container, stream, lap_windows, fps, video_offset, size, cancel_flag):
         super().__init__(daemon=True)
-        self._cap = cap
+        self._container = container
+        self._stream = stream
         self._lap_windows = lap_windows
         self._fps = fps
         self._video_offset = video_offset
         self._size = size
-        self._max_gap = max_sequential_gap_ms
         self._cancel = cancel_flag
         self.queue: queue.Queue = queue.Queue(maxsize=self._QUEUE_DEPTH)
-        self._lb = _LetterboxHelper(size)
+        self.error: Exception | None = None
+        # Letterbox geometry: the decoder scales straight to the fitted size
+        # (GPU decode + libswscale), so only the bar padding is done here.
+        target_w, target_h = size
+        src_w, src_h = stream.codec_context.width, stream.codec_context.height
+        scale = min(target_w / src_w, target_h / src_h)
+        self._fit_w, self._fit_h = max(2, int(src_w * scale)), max(2, int(src_h * scale))
+        self._x_off, self._y_off = (target_w - self._fit_w) // 2, (target_h - self._fit_h) // 2
+        self._half_frame = 0.5 / float(stream.average_rate or 30)
+
+    def _letterbox(self, scaled: np.ndarray) -> np.ndarray:
+        # Always a fresh array: the composite loop draws into it and fades it
+        # in place, and a reused source frame can be queued more than once.
+        target_w, target_h = self._size
+        if (self._fit_w, self._fit_h) == (target_w, target_h):
+            return scaled.copy()
+        out = np.zeros((target_h, target_w, 3), dtype=np.uint8)
+        out[self._y_off:self._y_off + self._fit_h, self._x_off:self._x_off + self._fit_w] = scaled
+        return out
 
     def run(self):
-        last_msec = -1.0
-        last_raw = None
+        container, stream = self._container, self._stream
+        frames = container.decode(stream)
+        last_t = -1.0
+        last_scaled = None
         try:
             for start, end, _ in self._lap_windows:
                 n_frames = max(0, int((end - start) * self._fps))
                 for fi in range(n_frames):
                     if self._cancel():
-                        self.queue.put((None, None))
                         return
                     t = start + fi / self._fps
-                    video_time = t - self._video_offset
-                    if video_time < 0:
+                    vt = t - self._video_offset
+                    if vt < 0:
                         self.queue.put((t, None))  # None → use green screen
                         continue
-                    target_msec = video_time * 1000.0
-                    delta = target_msec - last_msec
-                    frame = None
-                    if -200.0 <= delta < 0:
-                        frame = last_raw
-                    elif 0 <= delta <= self._max_gap:
-                        for _ in range(30):
-                            ok, f = self._cap.read()
-                            if not ok:
-                                break
-                            frame = f
-                            last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
-                            if last_msec >= target_msec:
-                                break
-                    else:
-                        self._cap.set(cv2.CAP_PROP_POS_MSEC, target_msec)
-                        ok, frame = self._cap.read()
-                        if ok:
-                            last_msec = self._cap.get(cv2.CAP_PROP_POS_MSEC)
-                    if frame is not None:
-                        last_raw = frame
-                        frame = self._lb.apply(frame)
-                    self.queue.put((t, frame))
+                    if last_scaled is None or not (-self._half_frame <= vt - last_t <= self._MAX_SEQUENTIAL_GAP):
+                        container.seek(int(vt / stream.time_base), stream=stream, backward=True)
+                        frames = container.decode(stream)
+                        last_t, last_scaled = -1.0, None
+                    # Decode forward to the frame at vt. When the export fps is
+                    # above the source fps, last_t is already at/after vt and the
+                    # current frame is reused.
+                    while last_t < vt - self._half_frame:
+                        f = next(frames, None)
+                        if f is None:
+                            break
+                        last_t = f.time if f.time is not None else last_t
+                        last_scaled = f.to_ndarray(format="bgr24", width=self._fit_w, height=self._fit_h)
+                    self.queue.put((t, self._letterbox(last_scaled) if last_scaled is not None else None))
+        except Exception as e:
+            self.error = e
         finally:
             self.queue.put((None, None))  # end-of-stream sentinel
 
 
-class _LetterboxHelper:
-    """Same logic as ExportThread._letterbox but as a standalone object so
-    the decode thread can use it independently."""
-    def __init__(self, size):
-        self._size = size
-        self._params = None
-        self._canvas = None
-        self._resized = None
-        self._region = None
-
-    def apply(self, frame: np.ndarray) -> np.ndarray:
-        target_w, target_h = self._size
-        fh, fw = frame.shape[:2]
-        if fw <= 0 or fh <= 0:
-            return np.zeros((target_h, target_w, 3), dtype=np.uint8)
-        params = (fw, fh, target_w, target_h)
-        if self._params != params:
-            scale = min(target_w / fw, target_h / fh)
-            new_w, new_h = max(1, int(fw * scale)), max(1, int(fh * scale))
-            x_off, y_off = (target_w - new_w) // 2, (target_h - new_h) // 2
-            self._params = params
-            self._canvas = np.zeros((target_h, target_w, 3), dtype=np.uint8)
-            self._resized = np.empty((new_h, new_w, 3), dtype=np.uint8)
-            self._region = (x_off, y_off, new_w, new_h)
-        x_off, y_off, new_w, new_h = self._region
-        cv2.resize(frame, (new_w, new_h), dst=self._resized)
-        # Copy into a fresh array each time — the composite loop mutates the
-        # frame (widgets draw into it, fade applies in-place), so the decode
-        # thread must not hand out a buffer it's still using.
-        out = np.empty((target_h, target_w, 3), dtype=np.uint8)
-        out[:] = 0
-        out[y_off:y_off + new_h, x_off:x_off + new_w] = self._resized
-        return out
-
-
 class ExportThread(QThread):
     progress = Signal(int)
+    frameProgress = Signal(int, int)  # (frames done, total frames)
+    # Downscaled copy of a just-written frame, throttled — a live "viewer"
+    # in the progress dialog, like Resolve shows while rendering.
+    previewFrame = Signal(QImage)
     finished = Signal(str, str, str, float)  # (video_path, sync_file_path or "", audio_note or "", elapsed_sec)
     error = Signal(str)
     canceled = Signal()
+
+    _PREVIEW_INTERVAL = 0.1  # sec between preview frames
+    _PREVIEW_MAX_W = 640
 
     def __init__(self, widgets, data_log, fps, out_path,
                  lap_windows: list[tuple[float, float, list[tuple[int, float]]]] | None = None,
@@ -2749,6 +2886,15 @@ class ExportThread(QThread):
 
     def cancel(self):
         self._cancel_requested = True
+
+    def _preview_image(self, frame: np.ndarray) -> QImage:
+        h, w = frame.shape[:2]
+        scale = min(1.0, self._PREVIEW_MAX_W / max(1, w))
+        small = cv2.resize(frame, (max(1, int(w * scale)), max(1, int(h * scale))),
+                           interpolation=cv2.INTER_AREA)
+        rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+        sh, sw = rgb.shape[:2]
+        return QImage(rgb.data, sw, sh, rgb.strides[0], QImage.Format.Format_RGB888).copy()
 
     # Mirrors OverlayCanvas._video_frame_at's sequential-read optimization —
     # re-seeking every frame is what made the in-app preview laggy in the
@@ -2909,7 +3055,7 @@ class ExportThread(QThread):
 
     def run(self):
         writer = None
-        video_cap = None
+        video_container = video_stream = None
         start_time = time.time()
         try:
             dl = self.data_log
@@ -2920,9 +3066,10 @@ class ExportThread(QThread):
                 return
 
             if self.video_path:
-                video_cap = cv2.VideoCapture(self.video_path)
-                if not video_cap.isOpened():
-                    self.error.emit(f"Could not open video for compositing:\n{self.video_path}")
+                try:
+                    video_container, video_stream = _open_av_video(self.video_path)
+                except Exception as e:
+                    self.error.emit(f"Could not open video for compositing:\n{self.video_path}\n{e}")
                     return
                 w_max, h_max = self.output_size or (1920, 1080)
             elif self.crop_rect is not None:
@@ -2961,15 +3108,15 @@ class ExportThread(QThread):
             # Start decode thread so video I/O runs concurrently with
             # widget compositing and GPU encoding.
             decode_thread = None
-            if video_cap is not None:
+            if video_container is not None:
                 decode_thread = _DecodeThread(
-                    video_cap, self.lap_windows, self.fps, self.video_offset,
-                    (w_max, h_max), self._MAX_SEQUENTIAL_GAP_MS,
-                    lambda: self._cancel_requested,
+                    video_container, video_stream, self.lap_windows, self.fps, self.video_offset,
+                    (w_max, h_max), lambda: self._cancel_requested,
                 )
                 decode_thread.start()
 
             done = 0
+            last_preview = 0.0
             sync_entries = []
             for (start, _end, markers), n_frames in zip(self.lap_windows, frames_per_window):
                 for lap_number, marker_t in markers:
@@ -2990,7 +3137,9 @@ class ExportThread(QThread):
                     if decode_thread is not None:
                         _t, frame = decode_thread.queue.get()
                         if _t is None:  # sentinel: decode thread bailed early
-                            frame = green
+                            if decode_thread.error is not None:
+                                raise RuntimeError(f"Video decode failed: {decode_thread.error}")
+                            frame = green.copy()
                         elif frame is None:
                             frame = green.copy()  # green screen for pre-roll frames
                     else:
@@ -3013,14 +3162,19 @@ class ExportThread(QThread):
                     writer.write(out_frame)
                     done += 1
                     self.progress.emit(int(done / total_frames * 100))
+                    self.frameProgress.emit(done, total_frames)
+                    now = time.monotonic()
+                    if now - last_preview >= self._PREVIEW_INTERVAL or done == total_frames:
+                        last_preview = now
+                        self.previewFrame.emit(self._preview_image(out_frame))
 
             writer.release()
             writer = None
             if decode_thread is not None:
                 decode_thread.join(timeout=10)
-            if video_cap is not None:
-                video_cap.release()
-                video_cap = None
+            if video_container is not None:
+                video_container.close()
+                video_container = None
 
             audio_note = ""
             if self.video_path:
@@ -3045,8 +3199,6 @@ class ExportThread(QThread):
         except Exception as e:
             if writer is not None:
                 writer.release()
-            if video_cap is not None:
-                video_cap.release()
             self.error.emit(str(e))
 
 
@@ -3395,6 +3547,76 @@ class DataWizardDialog(QDialog):
 # Main window
 # ---------------------------------------------------------------------------
 
+class ExportProgressDialog(QDialog):
+    """Render progress with a live view of frames as they're written."""
+
+    canceled = pyqtSignal()
+
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self._start = time.monotonic()
+        self._last_qimg: QImage | None = None
+
+        layout = QVBoxLayout(self)
+        self.lbl_preview = QLabel("Starting…")
+        self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_preview.setMinimumSize(480, 270)
+        self.lbl_preview.setStyleSheet("background-color: black; color: #888;")
+        layout.addWidget(self.lbl_preview, 1)
+
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 100)
+        layout.addWidget(self.bar)
+
+        row = QHBoxLayout()
+        self.lbl_status = QLabel("")
+        row.addWidget(self.lbl_status, 1)
+        self.btn_cancel = QPushButton("Cancel")
+        self.btn_cancel.clicked.connect(self.reject)
+        row.addWidget(self.btn_cancel)
+        layout.addLayout(row)
+        self.resize(660, 460)
+
+    def connect_thread(self, thread: "ExportThread"):
+        thread.progress.connect(self.bar.setValue)
+        thread.frameProgress.connect(self._on_frames)
+        thread.previewFrame.connect(self._on_preview)
+        self.canceled.connect(thread.cancel)
+
+    def _on_frames(self, done: int, total: int):
+        if done >= total:
+            self.lbl_status.setText(f"{total} frames rendered — finishing up (audio)…")
+            self.btn_cancel.setEnabled(False)
+            return
+        elapsed = time.monotonic() - self._start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        self.lbl_status.setText(f"Frame {done} / {total}  ·  {rate:.0f} fps  ·  ~{_format_duration(eta)} left")
+
+    def _on_preview(self, qimg: QImage):
+        self._last_qimg = qimg
+        self._show_preview()
+
+    def _show_preview(self):
+        if self._last_qimg is not None:
+            self.lbl_preview.setPixmap(QPixmap.fromImage(self._last_qimg).scaled(
+                self.lbl_preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._show_preview()
+
+    def reject(self):
+        # Cancel button, Esc, and the window's X all land here.
+        if self.btn_cancel.isEnabled():
+            self.btn_cancel.setEnabled(False)
+            self.lbl_status.setText("Canceling…")
+            self.canceled.emit()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -3605,11 +3827,13 @@ class MainWindow(QMainWindow):
         lyl.addLayout(res_form)
 
         grp_widgets = QGroupBox("Add Widget")
-        wl = QVBoxLayout(grp_widgets)
-        for wtype in WIDGET_TYPES:
-            btn = QPushButton(wtype)
-            btn.clicked.connect(lambda checked, t=wtype: self.canvas.add_widget(t))
-            wl.addWidget(btn)
+        wl = QHBoxLayout(grp_widgets)
+        self.cmb_add_widget = QComboBox()
+        self.cmb_add_widget.addItems(WIDGET_TYPES)
+        btn_add_widget = QPushButton("Add")
+        btn_add_widget.clicked.connect(lambda: self.canvas.add_widget(self.cmb_add_widget.currentText()))
+        wl.addWidget(self.cmb_add_widget, 1)
+        wl.addWidget(btn_add_widget)
 
         self.btn_delete = QPushButton("Delete Selected")
         self.btn_delete.clicked.connect(self.canvas_delete)
@@ -4354,8 +4578,7 @@ class MainWindow(QMainWindow):
             )
             return
 
-        progress = QProgressDialog("Rendering overlay video…", "Cancel", 0, 100, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress = ExportProgressDialog("Rendering overlay video", self)
         progress.show()
 
         crop_rect = self.canvas.crop_rect() if self.canvas.aspect_ratio != "Original" else None
@@ -4368,10 +4591,9 @@ class MainWindow(QMainWindow):
             crop_rect=crop_rect,
             fade_duration=self.spn_fade_duration.value() if self.chk_fade.isChecked() else 0.0,
         )
-        progress.canceled.connect(self._export_thread.cancel)
-        self._export_thread.progress.connect(progress.setValue)
+        progress.connect_thread(self._export_thread)
         self._export_thread.finished.connect(lambda video_path, sync_path, audio_note, elapsed: (
-            progress.close(),
+            progress.accept(),
             self._show_export_done(
                 "Done",
                 f"Exported to:\n{video_path}"
@@ -4382,11 +4604,11 @@ class MainWindow(QMainWindow):
             )
         ))
         self._export_thread.error.connect(lambda e: (
-            progress.close(),
+            progress.accept(),
             QMessageBox.critical(self, "Export Error", e)
         ))
         self._export_thread.canceled.connect(lambda: (
-            progress.close(),
+            progress.accept(),
             self.statusBar().showMessage("Export canceled.")
         ))
         self._export_thread.start()
@@ -4416,8 +4638,7 @@ class MainWindow(QMainWindow):
             i += 1
         path = os.path.join(out_dir, f"sample_clip_{i}.mp4")
 
-        progress = QProgressDialog("Rendering 5s sample…", "Cancel", 0, 100, self)
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress = ExportProgressDialog("Rendering 5s sample", self)
         progress.show()
 
         crop_rect = self.canvas.crop_rect() if self.canvas.aspect_ratio != "Original" else None
@@ -4429,10 +4650,9 @@ class MainWindow(QMainWindow):
             output_size=(self.spn_res_w.value(), self.spn_res_h.value()),
             crop_rect=crop_rect,
         )
-        progress.canceled.connect(self._sample_export_thread.cancel)
-        self._sample_export_thread.progress.connect(progress.setValue)
+        progress.connect_thread(self._sample_export_thread)
         self._sample_export_thread.finished.connect(lambda video_path, sync_path, audio_note, elapsed: (
-            progress.close(),
+            progress.accept(),
             self._show_export_done(
                 "Done",
                 f"Sample clip exported to:\n{video_path}\n\nRender time: {_format_duration(elapsed)}",
@@ -4440,11 +4660,11 @@ class MainWindow(QMainWindow):
             )
         ))
         self._sample_export_thread.error.connect(lambda e: (
-            progress.close(),
+            progress.accept(),
             QMessageBox.critical(self, "Export Error", e)
         ))
         self._sample_export_thread.canceled.connect(lambda: (
-            progress.close(),
+            progress.accept(),
             self.statusBar().showMessage("Sample export canceled.")
         ))
         self._sample_export_thread.start()
