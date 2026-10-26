@@ -38,9 +38,9 @@ from PyQt6.QtWidgets import (
     QMessageBox, QColorDialog, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView
 )
-from PyQt6.QtCore import Qt, QRect, QPoint, QPointF, QSize, QTimer, QUrl, QSettings, pyqtSignal, QThread, QObject, pyqtSignal as Signal
+from PyQt6.QtCore import Qt, QRect, QRectF, QPoint, QPointF, QSize, QTimer, QUrl, QSettings, pyqtSignal, QThread, QObject, pyqtSignal as Signal
 from PyQt6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QPixmap, QImage,
+    QPainter, QColor, QPen, QBrush, QFont, QFontMetrics, QFontMetricsF, QPixmap, QImage,
     QAction, QCursor, QDesktopServices, QPolygonF
 )
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -957,7 +957,13 @@ class DataLog:
 # Widget definitions
 # ---------------------------------------------------------------------------
 
-WIDGET_TYPES = ["Lap Timer", "Numeric Display", "Bar Graph", "Track Map", "Data Trace"]
+WIDGET_TYPES = ["Lap Timer", "Numeric Display", "Bar Graph", "Track Map", "Data Trace", "G Meter"]
+
+# Preferred default channels for a new G Meter, first match wins. GPS-derived
+# accel is preferred: IMU channels depend on how the logger is mounted (an
+# on-its-side logger puts gravity into InlineAcc).
+G_METER_LONG_CHANNELS = ["GPS LonAcc", "LonAcc", "Longitudinal Acc", "InlineAcc"]
+G_METER_LAT_CHANNELS = ["GPS LatAcc", "LatAcc", "Lateral Acc", "LateralAcc"]
 
 # Widgets whose width and height scale independently (corner drag / Scale X+Y).
 FREE_ASPECT_TYPES = ("Bar Graph", "Data Trace")
@@ -969,6 +975,7 @@ BASE_SIZES = {
     "Bar Graph": (200, 60),
     "Track Map": (220, 220),
     "Data Trace": (300, 100),
+    "G Meter": (220, 220),
 }
 BASE_FONT_SIZE = 24
 
@@ -1087,7 +1094,21 @@ class OverlayWidget:
         # ("XXX") and the label beneath it, rather than tying the label to
         # whatever the corner-drag scale computes for the value.
         self.label_font_size: int = 16
+        self.int_digits: int = 3  # Numeric Display: integer digits the box is sized for
+        self.label_gap: int = 0  # Numeric Display: px added to the default number→label spacing
         self.trace_window: float = 3.0  # Data Trace: seconds of history shown
+        self.map_rotation: int = 0  # Track Map: clockwise degrees, multiple of 90
+        # G Meter: one channel per axis, each with its own ±range and sign flip
+        self.long_channel: str = ""
+        self.lat_channel: str = ""
+        self.g_range_long: float = 2.0
+        self.g_range_lat: float = 2.0
+        self.invert_long: bool = False
+        self.invert_lat: bool = False
+        self.marker_scale: float = 1.0
+        if widget_type == "G Meter":
+            self.decimals = 1
+            self.color = (0, 200, 255)  # amber marker
         if widget_type == "Data Trace":
             self.color = (0, 200, 255)  # amber; green would vanish when chroma-keyed
         self._size_sig = None
@@ -1111,10 +1132,27 @@ class OverlayWidget:
         return lines
 
     def _numeric_ref_text(self) -> str:
-        # "000.00" (or however many decimals) covers triple-digit readings
-        # (e.g. mph) — a fixed budget so the box doesn't resize as the live
-        # value changes. The label is sized/drawn separately (see w/h below).
-        return "000" + (f".{'0' * self.decimals}" if self.decimals > 0 else "")
+        # Fixed-width budget ("000.0" etc.) so the box doesn't resize as the
+        # live value changes; integer digits come from the Digits setting.
+        return "0" * max(1, self.int_digits or 3) + (f".{'0' * self.decimals}" if self.decimals > 0 else "")
+
+    def _label_gap_px(self) -> int:
+        # Default spacing plus the user's Label Gap adjustment; never let the
+        # label rise above the top of the number.
+        return max(-_pil_text_size(self._numeric_ref_text(), self.font_size, bold=True)[1],
+                   _numeric_gap(self.label_font_size) + self.label_gap)
+
+    def numeric_layout(self, value: float):
+        """Numeric Display text placement in overlay px, relative to the box:
+        [(text, top, px, bold)], each centred horizontally. Shared by the
+        export and the live preview so both place text identically."""
+        border = _numeric_border(self.font_size)
+        _, value_h = _pil_text_size(self._numeric_ref_text(), self.font_size, bold=True)
+        items = [(f"{value:.{self.decimals}f}", border, self.font_size, True)]
+        if self.label:
+            items.append((self.label, border + value_h + self._label_gap_px(),
+                          self.label_font_size, False))
+        return items
 
     def _compute_w(self) -> int:
         if self.widget_type == "Lap Timer":
@@ -1128,9 +1166,8 @@ class OverlayWidget:
             return text_w + padding
         if self.widget_type == "Numeric Display":
             value_w, _ = _pil_text_size(self._numeric_ref_text(), self.font_size, bold=True)
-            label_w, _ = _pil_text_size(self.label, self.label_font_size)
-            padding = 16 + int(self.font_size * 0.3)
-            return max(value_w, label_w) + padding
+            label_w = _pil_text_size(self.label, self.label_font_size)[0] if self.label else 0
+            return max(value_w, label_w) + 2 * _numeric_border(self.font_size)
         return max(1, int(self.base_size[0] * self.scale_x))
 
     def _compute_h(self) -> int:
@@ -1145,10 +1182,12 @@ class OverlayWidget:
         if self.widget_type == "Numeric Display":
             # Stacked layout: value on top, label below, each sized by its
             # own independent font setting.
+            border = _numeric_border(self.font_size)
             _, value_h = _pil_text_size(self._numeric_ref_text(), self.font_size, bold=True)
-            _, label_h = _pil_text_size(self.label or "A", self.label_font_size)
-            padding = 16 + int(self.font_size * 0.2)
-            return value_h + 4 + label_h + padding
+            label_part = 0
+            if self.label:
+                label_part = self._label_gap_px() + _pil_text_size(self.label, self.label_font_size)[1]
+            return border + value_h + label_part + border
         return max(1, int(self.base_size[1] * self.scale_y))
 
     def _refresh_size_cache(self):
@@ -1160,7 +1199,8 @@ class OverlayWidget:
         since the previous frame. Recompute only when something that
         actually affects sizing has changed."""
         sig = (self.widget_type, self.scale_x, self.scale_y, self.label, self.decimals,
-               self.label_font_size, self.show_time, self.show_last, self.show_best, self.show_lap)
+               self.label_font_size, self.show_time, self.show_last, self.show_best, self.show_lap,
+               self.int_digits, self.label_gap)
         if sig != self._size_sig:
             self._size_sig = sig
             self._size_cached = (self._compute_w(), self._compute_h())
@@ -1200,8 +1240,7 @@ class OverlayWidget:
         val = data_log.value_at(self.channel, time_sec) if self.channel else 0.0
 
         if self.widget_type == "Numeric Display":
-            _draw_numeric(frame, x, y, w, h, self.label, val, self.font_size, self.label_font_size,
-                          self.decimals, self.text_color)
+            _draw_numeric(frame, x, y, w, h, self, val)
 
         elif self.widget_type == "Bar Graph":
             lo, hi = self.min_val, self.max_val
@@ -1225,29 +1264,38 @@ class OverlayWidget:
 
         elif self.widget_type == "Track Map":
             if "GPS Latitude" in data_log.channels and "GPS Longitude" in data_log.channels:
-                _draw_track_map(frame, x, y, w, h, data_log, time_sec, self.label, self.font_size, self.text_color)
+                _draw_track_map(frame, x, y, w, h, data_log, time_sec, self.label, self.font_size, self.text_color,
+                                self.map_rotation)
 
         elif self.widget_type == "Data Trace":
             _draw_data_trace(frame, x, y, w, h, self, data_log, time_sec)
+
+        elif self.widget_type == "G Meter":
+            _draw_g_meter(frame, x, y, w, h, self, data_log, time_sec)
 
 
 # ---------------------------------------------------------------------------
 # OpenCV drawing helpers
 # ---------------------------------------------------------------------------
 
-def _draw_numeric(frame, x, y, w, h, label, value, font_size, label_font_size, decimals, text_color):
-    cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
+def _numeric_border(font_size: int) -> int:
+    """Padding around a Numeric Display's text — small, and growing slowly with size."""
+    return max(4, int(font_size * 0.12))
 
-    value_text = f"{value:.{decimals}f}"
-    value_w, value_h = _pil_text_size(value_text, font_size, bold=True)
-    label_w, label_h = _pil_text_size(label, label_font_size)
-    rgb = tuple(reversed(text_color))
+
+def _numeric_gap(label_font_size: int) -> int:
+    return max(2, int(label_font_size * 0.3))
+
+
+def _draw_numeric(frame, x, y, w, h, widget: "OverlayWidget", value: float):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
+    rgb = tuple(reversed(widget.text_color))
+    items = widget.numeric_layout(value)
 
     def draw(d: ImageDraw.ImageDraw, rx, ry, rw, rh):
-        value_x = rx + max(0, (w - value_w) // 2)
-        _pil_draw_text(d, (value_x, ry + 8), value_text, _get_pil_font(font_size, bold=True), rgb)
-        label_x = rx + max(0, (w - label_w) // 2)
-        _pil_draw_text(d, (label_x, ry + 8 + value_h + 4), label, _get_pil_font(label_font_size), rgb)
+        for text, top, px, bold in items:
+            tw = _pil_text_size(text, px, bold=bold)[0]
+            _pil_draw_text(d, (rx + (w - tw) // 2, ry + top), text, _get_pil_font(px, bold=bold), rgb)
 
     _render_text_region(frame, x, y, w, h, draw)
 
@@ -1342,24 +1390,40 @@ def _draw_lap_timer(frame, x, y, w, h, lines, font_size, text_color):
     _render_text_region(frame, x, y, w, h, draw)
 
 
-_track_map_px_cache: dict = {}  # (id(data_log), x, y, w, h) → np.ndarray of shape (N,1,2) int32
+_track_map_px_cache: dict = {}  # (id(data_log), x, y, w, h, rotation) → np.ndarray of shape (N,1,2) int32
 
 
-def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label="", font_size=BASE_FONT_SIZE, text_color=(255, 255, 255)):
+def _track_map_label_band(label: str, font_size: int) -> int:
+    """Height (overlay px) reserved above the map for its label; 0 if none."""
+    return 8 + _pil_font_line_height(font_size) if label else 0
+
+
+def _track_map_uv(lat: float, lon: float, bounds, rotation: int) -> tuple[float, float]:
+    """GPS point → (u, v) in 0..1 box coordinates (v pointing down, north
+    up), then rotated clockwise by `rotation` degrees (a multiple of 90)."""
+    lat_min, lat_max, lon_min, lon_max = bounds
+    u = (lon - lon_min) / (lon_max - lon_min + 1e-9)
+    v = 1 - (lat - lat_min) / (lat_max - lat_min + 1e-9)
+    for _ in range((rotation // 90) % 4):
+        u, v = 1 - v, u
+    return u, v
+
+
+def _draw_track_map(frame, x, y, w, h, data_log: DataLog, time_sec: float, label="", font_size=BASE_FONT_SIZE,
+                    text_color=(255, 255, 255), rotation: int = 0):
     if not data_log.track_bounds or not data_log.track_downsampled:
         return
 
-    lat_min, lat_max, lon_min, lon_max = data_log.track_bounds
     pad = 10
+    top = _track_map_label_band(label, font_size)  # keep the map clear of the label
 
     def to_px(lat, lon):
-        px = int((lon - lon_min) / (lon_max - lon_min + 1e-9) * (w - pad * 2)) + x + pad
-        py = int((1 - (lat - lat_min) / (lat_max - lat_min + 1e-9)) * (h - pad * 2)) + y + pad
-        return px, py
+        u, v = _track_map_uv(lat, lon, data_log.track_bounds, rotation)
+        return int(u * (w - pad * 2)) + x + pad, int(v * (h - top - pad * 2)) + y + top + pad
 
     # Project the downsampled outline to pixel coords once per widget rect;
     # reuse across frames since the track shape and widget bounds don't change.
-    cache_key = (id(data_log), x, y, w, h)
+    cache_key = (id(data_log), x, y, w, h, rotation, top)
     pts_array = _track_map_px_cache.get(cache_key)
     if pts_array is None:
         pts = [to_px(lat, lon) for lat, lon in data_log.track_downsampled]
@@ -1452,7 +1516,133 @@ def _draw_data_trace(frame, x, y, w, h, widget: "OverlayWidget", data_log: "Data
     cv2.circle(frame, (int(round(cx)), int(round(now_y))), thickness + 2, widget.color, -1, cv2.LINE_AA)
 
 
-def _track_map_layout(data_log: "DataLog", rect: QRect, time_sec: float):
+def _g_meter_layout(data_log: "DataLog", widget: "OverlayWidget", time_sec: float,
+                    x: float, y: float, w: float, h: float) -> dict:
+    """Everything the G Meter draws, in the caller's pixel space — shared by
+    the export and the live preview so the two can't drift apart.
+      lines:  [((x0, y0), (x1, y1), is_axis)]  axes + tick marks
+      icons:  [((x0, y0), (x1, y1))]  chevron symbols, drawn in the text color
+      icon_width: stroke width for the icons
+      highlights: [((x0, y0), (x1, y1))]  axis component bars, marker color
+      highlight_width: stroke width for the highlights
+      marker: (mx, my, size)
+      texts:  [(text, ax, ay, align, px, bold)]  align "left"/"center"/"right";
+              ay is the text's top, ax its left edge / centre / right edge"""
+    long_g = data_log.value_at(widget.long_channel, time_sec) if (data_log and widget.long_channel) else 0.0
+    lat_g = data_log.value_at(widget.lat_channel, time_sec) if (data_log and widget.lat_channel) else 0.0
+    # Both axes are drawn sign-flipped by default (so braking moves the marker
+    # up), matching AiM logs as tested; "Invert" restores the raw channel sign.
+    if not widget.invert_long:
+        long_g = -long_g
+    if not widget.invert_lat:
+        lat_g = -lat_g
+    gsum = math.hypot(long_g, lat_g)
+
+    pad = max(3.0, min(w, h) * 0.05)
+    cx, cy = x + w / 2, y + h / 2
+    rl, rt = max(0.1, widget.g_range_long), max(0.1, widget.g_range_lat)
+    font_px = max(8, int(min(w, h) * 0.085))
+    small_px = max(7, int(font_px * 0.6))
+
+    # Axes stop short of the box edge to leave room for the end labels.
+    v_top, v_bot = y + pad + small_px * 1.4, y + h - pad - small_px * 1.4
+    h_left, h_right = x + pad + small_px * 1.2, x + w - pad - small_px * 1.2
+    half_h, half_w = (v_bot - v_top) / 2, (h_right - h_left) / 2
+    lines = [((cx, v_top), (cx, v_bot), True), ((h_left, cy), (h_right, cy), True)]
+    tick = max(3.0, min(w, h) * 0.04)
+    step = 0.5
+    for axis_range, half, vertical in ((rl, half_h, True), (rt, half_w, False)):
+        n = int(axis_range / step + 1e-6)
+        for i in range(-n, n + 1):
+            if i == 0:
+                continue
+            off = i * step / axis_range * half
+            if vertical:
+                lines.append(((cx - tick, cy - off), (cx + tick, cy - off), False))
+            else:
+                lines.append(((cx + off, cy - tick), (cx + off, cy + tick), False))
+
+    mx = cx + max(-1.0, min(1.0, lat_g / rt)) * half_w
+    my = cy - max(-1.0, min(1.0, long_g / rl)) * half_h
+    marker = (mx, my, max(2.0, min(w, h) * 0.045 * widget.marker_scale))
+    # Component bars along each axis, from the centre out to the marker's
+    # projection — drawn in the marker colour.
+    highlights = [((cx, cy), (cx, my)), ((cx, cy), (mx, cy))]
+    highlight_width = max(2.0, min(w, h) * 0.022)
+
+    # Chevron icons: a double "up" beside a double "down" for longitudinal,
+    # « » for lateral. Drawn as line segments so preview and export match.
+    s = font_px * 0.32
+
+    def chevron(px, py, dx, dy):
+        # tip at (px + dx*s, py + dy*s), pointing in direction (dx, dy)
+        tip = (px + dx * s * 0.5, py + dy * s * 0.5)
+        if dx == 0:
+            return [((px - s * 0.7, tip[1] - dy * s), tip), ((px + s * 0.7, tip[1] - dy * s), tip)]
+        return [((tip[0] - dx * s, py - s * 0.7), tip), ((tip[0] - dx * s, py + s * 0.7), tip)]
+
+    def double(px, py, dx, dy):
+        return chevron(px - dx * s * 0.6, py - dy * s * 0.6, dx, dy) + \
+               chevron(px + dx * s * 0.6, py + dy * s * 0.6, dx, dy)
+
+    line_h = font_px * 1.2
+    icon_h = font_px
+    d = widget.decimals
+    right = x + w - pad
+    icons = []
+    # Longitudinal: top-right, icon above value
+    ix, iy = right - s * 2.5, y + pad + icon_h / 2
+    icons += double(ix - s * 1.3, iy, 0, -1) + double(ix + s * 1.3, iy, 0, 1)
+    # Lateral: bottom-right, icon above value
+    lx, ly = right - s * 3.0, y + h - pad - line_h - icon_h / 2
+    icons += double(lx - s * 1.8, ly, -1, 0) + double(lx + s * 1.8, ly, 1, 0)
+
+    texts = [
+        ("Σ", x + pad, y + pad, "left", font_px, True),
+        (f"{gsum:.{d}f}G", x + pad, y + pad + line_h, "left", font_px, True),
+        (f"{abs(long_g):.{d}f}G", right, y + pad + icon_h + 2, "right", font_px, True),
+        (f"{abs(lat_g):.{d}f}G", right, y + h - pad - line_h, "right", font_px, True),
+        ("BRAKE", cx, y + pad, "center", small_px, False),
+        ("ACCEL", cx, y + h - pad - small_px, "center", small_px, False),
+        ("R", x + pad, cy - small_px / 2, "left", small_px, False),
+        ("L", x + w - pad, cy - small_px / 2, "right", small_px, False),
+    ]
+    return {"lines": lines, "icons": icons, "icon_width": max(1.5, font_px * 0.09),
+            "highlights": highlights, "highlight_width": highlight_width,
+            "marker": marker, "texts": texts}
+
+
+def _draw_g_meter(frame, x, y, w, h, widget: "OverlayWidget", data_log: "DataLog", time_sec: float):
+    cv2.rectangle(frame, (x, y), (x + w, y + h), (20, 20, 20), -1)
+    lay = _g_meter_layout(data_log, widget, time_sec, x, y, w, h)
+    for (x0, y0), (x1, y1), is_axis in lay["lines"]:
+        cv2.line(frame, (int(round(x0)), int(round(y0))), (int(round(x1)), int(round(y1))),
+                 (150, 150, 150) if is_axis else (110, 110, 110), 1, cv2.LINE_AA)
+    rgb = tuple(reversed(widget.text_color))
+
+    def draw(d: ImageDraw.ImageDraw, rx, ry, rw, rh):
+        for text, ax, ay, align, px, bold in lay["texts"]:
+            tw = _pil_text_size(text, px, bold=bold)[0]
+            tx = ax - x - (tw if align == "right" else tw / 2 if align == "center" else 0)
+            _pil_draw_text(d, (rx + int(tx), ry + int(ay - y)), text, _get_pil_font(px, bold=bold), rgb)
+
+    _render_text_region(frame, x, y, w, h, draw)
+    icon_thick = max(1, int(round(lay["icon_width"])))
+    for (x0, y0), (x1, y1) in lay["icons"]:
+        cv2.line(frame, (int(round(x0)), int(round(y0))), (int(round(x1)), int(round(y1))),
+                 widget.text_color, icon_thick, cv2.LINE_AA)
+    hl_thick = max(1, int(round(lay["highlight_width"])))
+    for (x0, y0), (x1, y1) in lay["highlights"]:
+        cv2.line(frame, (int(round(x0)), int(round(y0))), (int(round(x1)), int(round(y1))),
+                 widget.color, hl_thick, cv2.LINE_AA)
+    mx, my, size = lay["marker"]
+    half = size * 0.75
+    cv2.rectangle(frame, (int(round(mx - half)), int(round(my - half))),
+                  (int(round(mx + half)), int(round(my + half))), widget.color, -1)
+
+
+def _track_map_layout(data_log: "DataLog", rect: QRect, time_sec: float, rotation: int = 0,
+                      top_inset: float = 0.0):
     """Map the lap-1 reference GPS path + current position into QPoints within rect,
     for use by both the canvas live preview and (in principle) any other Qt-side view."""
     if not data_log.track_bounds:
@@ -1463,14 +1653,13 @@ def _track_map_layout(data_log: "DataLog", rect: QRect, time_sec: float):
     # array — track_lat/track_lon never change between paints, so redoing
     # this min/max + downsampling on every single live-preview frame was
     # pure waste.
-    lat_min, lat_max, lon_min, lon_max = data_log.track_bounds
     pad = 4
     x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
 
     def to_pt(lat, lon):
-        px = (lon - lon_min) / (lon_max - lon_min + 1e-9) * (w - pad * 2) + x + pad
-        py = (1 - (lat - lat_min) / (lat_max - lat_min + 1e-9)) * (h - pad * 2) + y + pad
-        return QPoint(int(px), int(py))
+        u, v = _track_map_uv(lat, lon, data_log.track_bounds, rotation)
+        return QPoint(int(u * (w - pad * 2) + x + pad),
+                      int(v * (h - top_inset - pad * 2) + y + top_inset + pad))
 
     pts = [to_pt(lat, lon) for lat, lon in data_log.track_downsampled]
 
@@ -1949,7 +2138,8 @@ class OverlayCanvas(QWidget):
                 painter.drawRect(rect)
 
             if w.widget_type == "Track Map" and self._data_log:
-                layout = _track_map_layout(self._data_log, rect, wt)
+                layout = _track_map_layout(self._data_log, rect, wt, w.map_rotation,
+                                           _track_map_label_band(w.label, w.font_size) * s)
                 if layout:
                     pts, dot = layout
                     track_pen = QPen(QColor(150, 150, 150))
@@ -2010,14 +2200,50 @@ class OverlayCanvas(QWidget):
                     painter.drawEllipse(QPointF(cx, now_y), r, r)
                     painter.setBrush(Qt.BrushStyle.NoBrush)
 
+            elif w.widget_type == "G Meter":
+                lay = _g_meter_layout(self._data_log, w, wt, rect.x(), rect.y(), rect.width(), rect.height())
+                for (x0, y0), (x1, y1), is_axis in lay["lines"]:
+                    painter.setPen(QPen(QColor(150, 150, 150) if is_axis else QColor(110, 110, 110), 1))
+                    painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+                text_qcolor = QColor(*reversed(w.text_color))
+                painter.setPen(QPen(text_qcolor))
+                for text, ax, ay, align, px, bold in lay["texts"]:
+                    g_font = QFont("Monospace")
+                    g_font.setPixelSize(px)
+                    g_font.setBold(bold)
+                    painter.setFont(g_font)
+                    fm = painter.fontMetrics()
+                    tw = fm.horizontalAdvance(text)
+                    tx = ax - (tw if align == "right" else tw / 2 if align == "center" else 0)
+                    painter.drawText(QPointF(tx, ay + fm.ascent()), text)
+                icon_pen = QPen(text_qcolor)
+                icon_pen.setWidthF(lay["icon_width"])
+                painter.setPen(icon_pen)
+                for (x0, y0), (x1, y1) in lay["icons"]:
+                    painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+                hl_pen = QPen(QColor(*reversed(w.color)))
+                hl_pen.setWidthF(lay["highlight_width"])
+                painter.setPen(hl_pen)
+                for (x0, y0), (x1, y1) in lay["highlights"]:
+                    painter.drawLine(QPointF(x0, y0), QPointF(x1, y1))
+                mx, my, size = lay["marker"]
+                half = size * 0.75
+                painter.fillRect(QRectF(mx - half, my - half, half * 2, half * 2), QColor(*reversed(w.color)))
+
             # Label
             painter.setPen(QPen(QColor(220, 220, 220)))
             pt_size = max(6, int(w.font_size / BASE_FONT_SIZE * 10 * s))
             font = QFont("Monospace", pt_size)
             painter.setFont(font)
             if w.widget_type == "Track Map":
-                painter.drawText(rect.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
-                                 w.label)
+                # Same size/offset as the export so it fits the band reserved above the map.
+                map_font = QFont("Monospace")
+                map_font.setPixelSize(max(6, int(w.font_size * s)))
+                painter.setFont(map_font)
+                painter.setPen(QPen(QColor(*reversed(w.text_color))))
+                off = int(8 * s)
+                painter.drawText(rect.adjusted(off, off, -off, 0),
+                                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop, w.label)
             elif w.widget_type == "Lap Timer":
                 dl = self._data_log
                 t = wt
@@ -2080,49 +2306,20 @@ class OverlayCanvas(QWidget):
                 painter.setPen(QPen(QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)))
                 painter.drawText(inner, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
             elif w.widget_type == "Numeric Display":
+                # Same placement as the export (OverlayWidget.numeric_layout),
+                # scaled to the canvas: each line's glyph top at `top`, centred.
                 val = self._data_log.value_at(w.channel, wt) if (self._data_log and w.channel) else 0.0
-                inner = rect.adjusted(8, 4, -4, -4)
-                text_color = QColor(*reversed(w.text_color)) if len(w.text_color) == 3 else QColor(255, 255, 255)
-
-                # Split inner's height between value/label in the same
-                # proportion OverlayWidget.h used (cv2 metrics) to size the
-                # box in the first place, then fit each one's own font to
-                # its share of (width, height) — see _fit_pt_for_text for
-                # why fitting just one dimension isn't enough.
-                cv_value_scale = w.font_size / 30.0
-                (_, cv_value_h), cv_value_base = cv2.getTextSize(
-                    w._numeric_ref_text(), cv2.FONT_HERSHEY_SIMPLEX, cv_value_scale, 2)
-                cv_label_scale = w.label_font_size / 30.0
-                (_, cv_label_h), cv_label_base = cv2.getTextSize(
-                    w.label or "A", cv2.FONT_HERSHEY_SIMPLEX, cv_label_scale, 1)
-                value_share = (cv_value_h + cv_value_base)
-                label_share = (cv_label_h + cv_label_base)
-                total_share = max(1, value_share + label_share)
-                value_h_budget = max(1, int(inner.height() * value_share / total_share))
-                label_h_budget = max(1, inner.height() - value_h_budget - 2)
-
-                value_text = f"{val:.{w.decimals}f}"
-                # Fit to the same fixed reference text the box width was
-                # computed from, not the live value — otherwise a shorter
-                # value (e.g. "0.00" vs the "000.00" budget) would render
-                # oversized and overflow the box instead of just leaving
-                # the same intentional slack the box was sized with.
-                value_pt = _fit_pt_for_text(w._numeric_ref_text(), inner.width(), value_h_budget, bold=True)
-                value_font = QFont("Monospace")
-                value_font.setPointSizeF(value_pt)
-                value_font.setBold(True)
-                value_rect = QRect(inner.x(), inner.y(), inner.width(), value_h_budget)
-                painter.setFont(value_font)
-                painter.setPen(QPen(text_color))
-                painter.drawText(value_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, value_text)
-
-                label_pt = _fit_pt_for_text(w.label or "A", inner.width(), label_h_budget)
-                label_font = QFont("Monospace")
-                label_font.setPointSizeF(label_pt)
-                label_rect = QRect(inner.x(), value_rect.bottom() + 2, inner.width(), label_h_budget)
-                painter.setFont(label_font)
-                painter.drawText(label_rect, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop, w.label)
-            elif w.widget_type != "Data Trace":  # Data Trace draws its own label above
+                painter.setPen(QPen(QColor(*reversed(w.text_color))))
+                for text, top, px, bold in w.numeric_layout(val):
+                    num_font = QFont("Monospace")
+                    num_font.setPixelSize(max(1, round(px * s)))
+                    num_font.setBold(bold)
+                    painter.setFont(num_font)
+                    ink = QFontMetricsF(num_font).tightBoundingRect(text)
+                    tx = rect.x() + (rect.width() - ink.width()) / 2 - ink.left()
+                    ty = rect.y() + top * s - ink.top()
+                    painter.drawText(QPointF(tx, ty), text)
+            elif w.widget_type not in ("Data Trace", "G Meter"):  # these draw their own text above
                 painter.drawText(rect.adjusted(4, 4, -4, -4), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
                                  w.label)
 
@@ -2273,6 +2470,10 @@ class OverlayCanvas(QWidget):
 
     def add_widget(self, widget_type: str):
         w = OverlayWidget(widget_type)
+        if widget_type == "G Meter" and self._data_log:
+            chans = self._data_log.channels
+            w.long_channel = next((c for c in G_METER_LONG_CHANNELS if c in chans), "")
+            w.lat_channel = next((c for c in G_METER_LAT_CHANNELS if c in chans), "")
         w.x, w.y = self._find_free_spot(w)
         self.widgets.append(w)
         for ww in self.widgets:
@@ -2393,6 +2594,12 @@ class PropertiesPanel(QWidget):
         self.spn_decimals.valueChanged.connect(self._on_decimals)
         layout.addRow("Decimals:", self.spn_decimals)
 
+        # Numeric Display: integer digits the box is sized for.
+        self.spn_int_digits = QSpinBox()
+        self.spn_int_digits.setRange(1, 7)
+        self.spn_int_digits.valueChanged.connect(self._on_int_digits)
+        layout.addRow("Digits:", self.spn_int_digits)
+
         # Numeric Display: the value ("XXX") uses Scale above; the label
         # beneath it gets its own independent absolute size here.
         self.spn_label_font_size = QSpinBox()
@@ -2400,6 +2607,13 @@ class PropertiesPanel(QWidget):
         self.spn_label_font_size.setValue(16)
         self.spn_label_font_size.valueChanged.connect(self._on_label_font_size)
         layout.addRow("Label Font Size:", self.spn_label_font_size)
+
+        self.spn_label_gap = QSpinBox()
+        self.spn_label_gap.setRange(-300, 300)
+        self.spn_label_gap.setSuffix(" px")
+        self.spn_label_gap.setToolTip("Space between the number and its label (0 = default; negative = closer)")
+        self.spn_label_gap.valueChanged.connect(self._on_label_gap)
+        layout.addRow("Label Gap:", self.spn_label_gap)
 
         self.spn_trace_window = QDoubleSpinBox()
         self.spn_trace_window.setRange(0.5, 60.0)
@@ -2409,6 +2623,54 @@ class PropertiesPanel(QWidget):
         self.spn_trace_window.setValue(3.0)
         self.spn_trace_window.valueChanged.connect(self._on_trace_window)
         layout.addRow("Time Window:", self.spn_trace_window)
+
+        # G Meter: one channel + range + sign flip per axis
+        self.g_rows = []
+        for axis, title in (("long", "Long. Channel:"), ("lat", "Lat. Channel:")):
+            cmb = QComboBox()
+            cmb.addItem("(none)")
+            cmb.addItems(self._channels)
+            cmb.currentTextChanged.connect(lambda text, a=axis: self._on_g_channel(a, text))
+            layout.addRow(title, cmb)
+            spn = QDoubleSpinBox()
+            spn.setRange(0.25, 6.0)
+            spn.setSingleStep(0.25)
+            spn.setDecimals(2)
+            spn.setPrefix("± ")
+            spn.setSuffix(" G")
+            spn.valueChanged.connect(lambda v, a=axis: self._on_g_range(a, v))
+            layout.addRow("Long. Range:" if axis == "long" else "Lat. Range:", spn)
+            chk = QCheckBox("Invert")
+            chk.toggled.connect(lambda checked, a=axis: self._on_g_invert(a, checked))
+            layout.addRow("", chk)
+            setattr(self, f"cmb_{axis}_channel", cmb)
+            setattr(self, f"spn_g_range_{axis}", spn)
+            setattr(self, f"chk_invert_{axis}", chk)
+            self.g_rows += [cmb, spn, chk]
+
+        self.spn_marker_scale = QDoubleSpinBox()
+        self.spn_marker_scale.setRange(0.25, 4.0)
+        self.spn_marker_scale.setSingleStep(0.25)
+        self.spn_marker_scale.setDecimals(2)
+        self.spn_marker_scale.setSuffix("×")
+        self.spn_marker_scale.valueChanged.connect(self._on_marker_scale)
+        layout.addRow("Marker Size:", self.spn_marker_scale)
+        self.g_rows.append(self.spn_marker_scale)
+
+        self.map_rotate_row = QWidget()
+        rot_layout = QHBoxLayout(self.map_rotate_row)
+        rot_layout.setContentsMargins(0, 0, 0, 0)
+        btn_rot_ccw = QPushButton("⟲ 90°")
+        btn_rot_ccw.setToolTip("Rotate the track map 90° counter-clockwise")
+        btn_rot_ccw.clicked.connect(lambda: self._on_rotate_map(-90))
+        btn_rot_cw = QPushButton("⟳ 90°")
+        btn_rot_cw.setToolTip("Rotate the track map 90° clockwise")
+        btn_rot_cw.clicked.connect(lambda: self._on_rotate_map(90))
+        self.lbl_map_rotation = QLabel("0°")
+        rot_layout.addWidget(btn_rot_ccw)
+        rot_layout.addWidget(btn_rot_cw)
+        rot_layout.addWidget(self.lbl_map_rotation)
+        layout.addRow("Rotate:", self.map_rotate_row)
 
         # Shifts just this widget's data lookup — fixes channels (e.g. CAN
         # bus data) that lag behind GPS-derived ones, without touching the
@@ -2432,18 +2694,25 @@ class PropertiesPanel(QWidget):
         self._set_row_visible(self.spn_scale_y, False)
         self._set_row_visible(self.spn_decimals, False)
         self._set_row_visible(self.spn_label_font_size, False)
+        self._set_row_visible(self.spn_int_digits, False)
+        self._set_row_visible(self.spn_label_gap, False)
         self._set_row_visible(self.spn_trace_window, False)
+        self._set_row_visible(self.map_rotate_row, False)
+        for row in self.g_rows:
+            self._set_row_visible(row, False)
         self.setEnabled(False)
 
     def set_channels(self, channels: list[str]):
         self._channels = channels
-        cur = self.cmb_channel.currentText()
-        self.cmb_channel.clear()
-        self.cmb_channel.addItem("(none)")
-        self.cmb_channel.addItems(channels)
-        idx = self.cmb_channel.findText(cur)
-        if idx >= 0:
-            self.cmb_channel.setCurrentIndex(idx)
+        for cmb in (self.cmb_channel, self.cmb_long_channel, self.cmb_lat_channel):
+            cur = cmb.currentText()
+            cmb.blockSignals(True)
+            cmb.clear()
+            cmb.addItem("(none)")
+            cmb.addItems(channels)
+            idx = cmb.findText(cur)
+            cmb.setCurrentIndex(idx if idx >= 0 else 0)
+            cmb.blockSignals(False)
 
     def load_widget(self, w: OverlayWidget | None):
         self._widget = w
@@ -2457,13 +2726,13 @@ class PropertiesPanel(QWidget):
         is_trace = w.widget_type == "Data Trace"
         free_aspect = w.widget_type in FREE_ASPECT_TYPES
         is_lap_timer = w.widget_type == "Lap Timer"
-        has_text_color = w.widget_type in ("Lap Timer", "Bar Graph", "Numeric Display", "Data Trace")
-        no_channel = is_lap_timer or w.widget_type == "Track Map"
+        has_text_color = w.widget_type in ("Lap Timer", "Bar Graph", "Numeric Display", "Data Trace", "G Meter")
+        no_channel = is_lap_timer or w.widget_type in ("Track Map", "G Meter")
         # Track Map doesn't render anything in widget.color — the generic
         # Color picker is otherwise the fill (Bar Graph) / border (Numeric
         # Display) color; Text Color is separate and used by all three
         # text-bearing widget types.
-        self._set_row_visible(self.btn_color, w.widget_type in ("Bar Graph", "Numeric Display", "Data Trace"))
+        self._set_row_visible(self.btn_color, w.widget_type in ("Bar Graph", "Numeric Display", "Data Trace", "G Meter"))
         self.chk_show_value.setVisible(is_bar)
         self.chk_show_value.blockSignals(True); self.chk_show_value.setChecked(w.show_value); self.chk_show_value.blockSignals(False)
 
@@ -2485,6 +2754,26 @@ class PropertiesPanel(QWidget):
         self._set_row_visible(self.spn_scale_x, free_aspect)
         self._set_row_visible(self.spn_scale_y, free_aspect)
         self._set_row_visible(self.spn_trace_window, is_trace)
+        self._set_row_visible(self.map_rotate_row, w.widget_type == "Track Map")
+        is_g = w.widget_type == "G Meter"
+        for row in self.g_rows:
+            self._set_row_visible(row, is_g)
+        for axis in ("long", "lat"):
+            cmb = getattr(self, f"cmb_{axis}_channel")
+            spn = getattr(self, f"spn_g_range_{axis}")
+            chk = getattr(self, f"chk_invert_{axis}")
+            for ctl in (cmb, spn, chk):
+                ctl.blockSignals(True)
+            idx = cmb.findText(getattr(w, f"{axis}_channel"))
+            cmb.setCurrentIndex(idx if idx >= 0 else 0)
+            spn.setValue(getattr(w, f"g_range_{axis}"))
+            chk.setChecked(getattr(w, f"invert_{axis}"))
+            for ctl in (cmb, spn, chk):
+                ctl.blockSignals(False)
+        self.spn_marker_scale.blockSignals(True)
+        self.spn_marker_scale.setValue(w.marker_scale)
+        self.spn_marker_scale.blockSignals(False)
+        self.lbl_map_rotation.setText(f"{w.map_rotation}°")
         self.spn_trace_window.blockSignals(True)
         self.spn_trace_window.setValue(w.trace_window)
         self.spn_trace_window.blockSignals(False)
@@ -2492,12 +2781,20 @@ class PropertiesPanel(QWidget):
         self.spn_max.blockSignals(True); self.spn_max.setValue(w.max_val); self.spn_max.blockSignals(False)
         self.spn_time_offset.blockSignals(True); self.spn_time_offset.setValue(w.time_offset); self.spn_time_offset.blockSignals(False)
 
-        has_decimals = w.widget_type in ("Numeric Display", "Bar Graph")
+        has_decimals = w.widget_type in ("Numeric Display", "Bar Graph", "G Meter")
         self._set_row_visible(self.spn_decimals, has_decimals)
         self.spn_decimals.blockSignals(True); self.spn_decimals.setValue(w.decimals); self.spn_decimals.blockSignals(False)
 
         is_numeric = w.widget_type == "Numeric Display"
+        self._set_row_visible(self.spn_int_digits, is_numeric)
+        self.spn_int_digits.blockSignals(True)
+        self.spn_int_digits.setValue(w.int_digits)
+        self.spn_int_digits.blockSignals(False)
         self._set_row_visible(self.spn_label_font_size, is_numeric)
+        self._set_row_visible(self.spn_label_gap, is_numeric)
+        self.spn_label_gap.blockSignals(True)
+        self.spn_label_gap.setValue(w.label_gap)
+        self.spn_label_gap.blockSignals(False)
         self.spn_label_font_size.blockSignals(True)
         self.spn_label_font_size.setValue(w.label_font_size)
         self.spn_label_font_size.blockSignals(False)
@@ -2505,6 +2802,42 @@ class PropertiesPanel(QWidget):
         self.cmb_channel.setEnabled(not no_channel)
         self.spn_min.setEnabled(not no_channel)
         self.spn_max.setEnabled(not no_channel)
+
+    def _on_g_channel(self, axis: str, text: str):
+        if self._widget:
+            setattr(self._widget, f"{axis}_channel", text if text != "(none)" else "")
+            self.changed.emit()
+
+    def _on_g_range(self, axis: str, value: float):
+        if self._widget:
+            setattr(self._widget, f"g_range_{axis}", value)
+            self.changed.emit()
+
+    def _on_label_gap(self, value: int):
+        if self._widget:
+            self._widget.label_gap = value
+            self.changed.emit()
+
+    def _on_int_digits(self, value: int):
+        if self._widget:
+            self._widget.int_digits = value
+            self.changed.emit()
+
+    def _on_marker_scale(self, value: float):
+        if self._widget:
+            self._widget.marker_scale = value
+            self.changed.emit()
+
+    def _on_g_invert(self, axis: str, checked: bool):
+        if self._widget:
+            setattr(self._widget, f"invert_{axis}", checked)
+            self.changed.emit()
+
+    def _on_rotate_map(self, delta: int):
+        if self._widget:
+            self._widget.map_rotation = (self._widget.map_rotation + delta) % 360
+            self.lbl_map_rotation.setText(f"{self._widget.map_rotation}°")
+            self.changed.emit()
 
     def _on_trace_window(self, value):
         if self._widget:
